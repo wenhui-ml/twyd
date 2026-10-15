@@ -1,3 +1,4 @@
+from transformers import AutoModelForCausalLM
 """Standalone Dense-LRC distillation trainer (no ms-swift dependency).
 
 Teacher: Llama-3.2-1B (H=2048, d_ff=8192, rho=4.0). Student: dense continuation
@@ -39,7 +40,7 @@ def build_student_from_teacher(teacher, r: int):
         cfg.hidden_size = r
         cfg.num_attention_heads = max(4, tc.num_attention_heads // 2)
         cfg.num_key_value_heads = max(2, tc.num_key_value_heads // 2)
-    student = AutoModel.from_config(cfg)
+    student = AutoModelForCausalLM.from_config(cfg)
     # inherit sliced weights where shapes allow (dense warm start at merged LRC point)
     with torch.no_grad():
         tsd = dict(teacher.named_parameters())
@@ -86,7 +87,7 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     try:
-        teacher = AutoModel.from_pretrained(
+        teacher = AutoModelForCausalLM.from_pretrained(
             local_teacher, dtype=torch.bfloat16,
             trust_remote_code=True).to(args.device).eval()
     except Exception:
