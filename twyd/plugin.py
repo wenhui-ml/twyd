@@ -2,6 +2,33 @@
 from .loss import LrcDistillLoss
 from .tuner import CoreLRCAdapter, DenseLRCAdapter, PlainLRCAdapter
 
+try:
+    from transformers import TrainerCallback as _Cb
+
+    class TwydInputCacheCallback(_Cb):
+        """Cache raw batch inputs on trainer._twyd_inputs before swift strips them.
+
+        ms-swift seq2seq_trainer.compute_loss pops labels/compute_loss_func and
+        template.compute_sft_loss consumes inputs; loss_fn then cannot see
+        input_ids for the teacher forward. This callback runs first and saves
+        the tensors loss needs. Register via --callbacks twyd.plugin.TwydInputCacheCallback
+        or rely on wrapper._twyd_last_inputs fallback.
+        """
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            inputs = kwargs.get("inputs", None)
+            trainer = kwargs.get("trainer", None)
+            if inputs is not None and trainer is not None:
+                try:
+                    keep = {k: v for k, v in inputs.items()
+                            if k in ("input_ids", "attention_mask", "position_ids")}
+                    if keep:
+                        trainer._twyd_inputs = keep
+                except Exception:
+                    pass
+except Exception:  # transformers not available at import time
+    TwydInputCacheCallback = None  # type: ignore
+
 _TUNERS = {"dense_lrc": DenseLRCAdapter, "core_lrc": CoreLRCAdapter, "plain_lrc": PlainLRCAdapter}
 _LOSSES = {"lrc_distill": LrcDistillLoss}
 
@@ -19,4 +46,4 @@ try:
 except Exception:
     pass
 
-__all__ = ["_TUNERS", "_LOSSES"]
+__all__ = ["_TUNERS", "_LOSSES", "TwydInputCacheCallback"]

@@ -2,21 +2,29 @@
 
 L = wKL * T^2 * KL(softmax(zT/T) || softmax(zS/T))
   + wNTP * CE(y, zS)
-  + lambda_aux * L_align   (hidden MSE + attn Q/K/V/O cosine/MSE + MLP MSE, Eq.7)
+  + lambda_aux * L_align   (hidden MSE, Eq.7 minimal; attn/MLP alignment off by default)
 
-Teacher forward runs under no_grad via wrapper.get_teacher_outputs(); if the
-model is not a twyd wrapper (plain HF model + same-model teacher), falls back
-to logit-KL-only generic (GPD-style) distillation so the reachable-set
-contrast stays measurable without the LRC objective.
+Teacher forward runs under no_grad via wrapper.get_teacher_outputs(); inputs
+are read from (1) trainer._twyd_inputs (callback), (2) wrapper._twyd_last_inputs
+(cached in _TwydWrapper.forward, survives ms-swift input stripping).
 """
 import torch
 import torch.nn.functional as F
 
 
-class LrcDistillLoss:
+try:
+    from swift.loss.base import BaseLoss as _BaseLoss
+except Exception:  # standalone test without ms-swift installed
+    _BaseLoss = object
+
+
+class LrcDistillLoss(_BaseLoss):
     def __init__(self, args, trainer):
-        self.args = args
-        self.trainer = trainer
+        try:
+            super().__init__(args, trainer)
+        except Exception:
+            self.args = args
+            self.trainer = trainer
         kw = dict(getattr(args, "tuner_kwargs", None) or {})
         self.T = float(kw.get("kl_temperature", 40.0))
         self.wKL = float(kw.get("kl_weight", 1.0))
@@ -45,13 +53,28 @@ class LrcDistillLoss:
             use_aux = self.use_aux
         logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
         inputs = dict(getattr(self.trainer, "_twyd_inputs", {}) or {})
-        t_logits = None
+        if not inputs:
+            # Fallback: wrapper caches inputs in forward() before swift strips them.
+            try:
+                cached = getattr(m, "_twyd_last_inputs", None) or getattr(raw_model, "_twyd_last_inputs", None)
+                if cached:
+                    inputs = dict(cached)
+            except Exception:
+                pass
+        t_logits, t_hidden = None, None
         get_t = getattr(m, "get_teacher_outputs", None)
+        if get_t is None:
+            get_t = getattr(raw_model, "get_teacher_outputs", None)
         if get_t is not None and inputs:
             try:
                 t_out = get_t(**{k: v for k, v in inputs.items()
                                  if k in ("input_ids", "attention_mask", "position_ids")})
-                t_logits = t_out.logits if hasattr(t_out, "logits") else t_out["logits"]
+                t_logits = (t_out.logits if hasattr(t_out, "logits") else t_out["logits"]).detach()
+                try:
+                    # hidden_states only if model was run with output_hidden_states=True
+                    t_hidden = getattr(t_out, "hidden_states", None)
+                except Exception:
+                    t_hidden = None
             except Exception:
                 t_logits = None
         shift_s = logits[..., :-1, :].contiguous()
@@ -70,12 +93,31 @@ class LrcDistillLoss:
                           F.softmax(shift_t[..., :V] / T, dim=-1),
                           reduction="batchmean") * (T * T)
             loss = loss + wKL * kl
+        aux = None
         if use_aux and lam > 0:
-            aux = torch.zeros((), device=logits.device, dtype=logits.dtype)
-            loss = loss + lam * aux
+            # Minimal Eq.7: last-hidden MSE with teacher-width projection.
+            # Full per-layer hidden/attn/MLP alignment stays future work; previously
+            # this term was exactly zero (aux = zeros), now it measures something.
+            try:
+                s_hidden = getattr(outputs, "hidden_states", None)
+                if s_hidden is not None and t_hidden is not None and len(s_hidden) and len(t_hidden):
+                    sh, th = s_hidden[-1], t_hidden[-1]
+                    if sh.shape[-1] != th.shape[-1]:
+                        # Reuse teacher-col basis idea: least-squares project student->teacher width.
+                        # Cheap per-batch solve; no new parameters (not stored).
+                        A, B = sh.detach().reshape(-1, sh.shape[-1]), th.detach().reshape(-1, th.shape[-1])
+                        P = torch.linalg.lstsq(A.float(), B.float()).solution.to(sh.dtype)  # r x H
+                        aux = F.mse_loss(sh @ P, th)
+                    else:
+                        aux = F.mse_loss(sh.float(), th.float())
+            except Exception:
+                aux = None
+            if aux is not None and torch.isfinite(aux):
+                loss = loss + lam * aux
         try:
             self.trainer._twyd_last = {"kl": None if kl is None else float(kl.detach()),
-                                       "ntp": None if ntp is None else float(ntp.detach())}
+                                       "ntp": None if ntp is None else float(ntp.detach()),
+                                       "aux": None if aux is None else float(aux.detach())}
         except Exception:
             pass
         if loss_scale is not None:

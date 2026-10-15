@@ -1,4 +1,8 @@
-"""merge_weight: T Z^T (+ U_perp Z_perp^T) -> standard HF weight (Prop.1)."""
+"""merge_weight: T Z^T (+ U_perp Z_perp^T) -> standard HF weight (Prop.1).
+
+Dense branch: nn.Linear weights pass through verbatim (already d_ff x r).
+Core/plain: CoreLinear.merged_weight() rebuilds the deployed matrix.
+"""
 import json
 import os
 
@@ -15,12 +19,14 @@ def merged_state_dict(model) -> dict:
         out[n] = p.detach().cpu()
     for mod_name, mod in student.named_modules():
         mw = getattr(mod, "merged_weight", None)
-        if callable(mw) and not mod_name == "":
+        if callable(mw) and mod_name != "":
             with torch.no_grad():
                 W = mw().detach().cpu()
             # find param name: mod_name + ".weight"
             key = mod_name + ".weight"
             out[key] = W
+    # Dense branch has no merged_weight: its nn.Linear weights are already the
+    # deployed d_ff x r matrix and were copied in the named_parameters loop above.
     # teacher / buffers excluded; keep student trainable-dense params
     for n, buf in student.named_buffers():
         if "basis_" in n:

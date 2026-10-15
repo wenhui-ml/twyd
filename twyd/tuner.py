@@ -11,7 +11,6 @@ class CoreLinear(nn.Module):
     Down (RIGHT): W = Zr @ R + Z_perp_r @ V_perp, shape r x d_ff.
     Z_perp=0  =>  exactly the plain-LRC student at step 0 (Prop.1).
     """
-
     def __init__(self, T_or_R: torch.Tensor, Z_col: torch.Tensor,
                  U_perp_or_V: Optional[torch.Tensor] = None,
                  Z_perp: Optional[torch.Tensor] = None,
@@ -50,6 +49,12 @@ from typing import Dict, List
 from .core_basis import build_core_basis
 
 
+try:
+    from swift.tuner_plugin.base import Tuner as _TunerBase
+except Exception:  # standalone test without ms-swift
+    _TunerBase = object
+
+
 def _mlp_module_names(model: nn.Module, target_modules: List[str]) -> List[str]:
     names = []
     for n, m in model.named_modules():
@@ -81,11 +86,33 @@ class _TwydWrapper(nn.Module):
         self.config = getattr(student, "config", None)
 
     def forward(self, *args, **kwargs):
+        # Cache last student inputs so LrcDistillLoss can run the frozen
+        # teacher on the same batch (ms-swift strips inputs before loss_fn).
+        try:
+            keep = {}
+            for k in ("input_ids", "attention_mask", "position_ids"):
+                if k in kwargs and kwargs[k] is not None:
+                    v = kwargs[k]
+                    keep[k] = v.detach() if isinstance(v, torch.Tensor) else v
+            if keep:
+                self._twyd_last_inputs = keep
+        except Exception:
+            pass
         return self.student(*args, **kwargs)
 
     def get_teacher_outputs(self, **inputs):
+        t = self.teacher
+        # Align device/dtype with student inputs; teacher stays frozen/eval.
+        try:
+            ids = inputs.get("input_ids", None)
+            if isinstance(ids, torch.Tensor):
+                tdev = next(t.parameters()).device
+                if tdev != ids.device:
+                    t = t.to(ids.device)
+        except Exception:
+            pass
         with torch.no_grad():
-            return self.teacher(**inputs)
+            return t(**inputs)
 
     def gradient_checkpointing_enable(self, *a, **k):
         fn = getattr(self.student, "gradient_checkpointing_enable", None)
@@ -97,8 +124,19 @@ class _TwydWrapper(nn.Module):
 
 
 def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
-                              with_perp: bool) -> Dict[str, dict]:
-    teacher_hidden = int(teacher.config.hidden_size)
+                              branch: str) -> Dict[str, dict]:
+    """Build TWYD student MLP.
+
+    plain: CoreLinear(T, Z_col, with_perp=False) -> r x H trainable.
+    core:  CoreLinear(T, Z_col, U_perp, Z_perp=0, with_perp=True) -> r x d_ff trainable (Prop.1).
+    dense: nn.Linear(d_ff x r, trainable) init at merged plain weight (paper Sec 4.1).
+    """
+    with_perp = (branch == "core")
+    is_dense = (branch == "dense")
+    tcfg = getattr(teacher, "config", None)
+    teacher_hidden = int(getattr(tcfg, "hidden_size", getattr(getattr(tcfg, "text_config", None), "hidden_size", 0)) or 0)
+    if teacher_hidden == 0:
+        teacher_hidden = int(getattr(getattr(student, "config", None), "hidden_size", 0) or 0) * 2
     r = int(cfg.student_hidden) if cfg.student_hidden else teacher_hidden // 2
     meta: Dict[str, dict] = {}
     for mod_name in _mlp_module_names(student, list(cfg.target_modules)):
@@ -122,9 +160,15 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                     tmp[:, :min(r, s_w.shape[1])] = s_w[:d_ff, :min(r, s_w.shape[1])]
                     s_w = tmp
                 Z_col = (T.T @ s_w).T.contiguous()
-                Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
-                new_mod = CoreLinear(T, Z_col, P if with_perp else None,
-                                     Z_perp, side="left", with_perp=with_perp)
+                W0 = (T @ Z_col.T).contiguous()  # merged plain weight d_ff x r
+                if is_dense:
+                    new_mod = nn.Linear(r, d_ff, bias=False)
+                    with torch.no_grad():
+                        new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
+                else:
+                    Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
+                    new_mod = CoreLinear(T, Z_col, P if with_perp else None,
+                                         Z_perp, side="left", with_perp=with_perp)
             else:
                 H, d_ff = t_weight.shape
                 side = "right"
@@ -135,17 +179,29 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                     tmp[:min(r, s_w.shape[0]), :] = s_w[:min(r, s_w.shape[0]), :d_ff]
                     s_w = tmp
                 Z_col = (s_w @ R.T).contiguous()
-                Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
-                new_mod = CoreLinear(R, Z_col, Vp if with_perp else None,
-                                     Z_perp, side="right", with_perp=with_perp)
+                W0 = (Z_col @ R).contiguous()  # merged plain weight r x d_ff
+                if is_dense:
+                    new_mod = nn.Linear(d_ff, r, bias=False)
+                    with torch.no_grad():
+                        new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
+                else:
+                    Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
+                    new_mod = CoreLinear(R, Z_col, Vp if with_perp else None,
+                                         Z_perp, side="right", with_perp=with_perp)
         setattr(parent, attr, new_mod.to(dtype=lin.weight.dtype))
         meta[mod_name] = {"side": side, "d_ff": d_ff, "H": H, "r": r,
-                          "with_perp": with_perp, "branch": cfg.branch}
+                          "with_perp": with_perp, "is_dense": is_dense, "branch": cfg.branch}
     return meta
+
 
 def _freeze_for_branch(wrapper, cfg) -> None:
     if cfg.branch == "dense":
-        wrapper.student.requires_grad_(True)
+        # Train-what-you-deploy: only MLP linears we replaced stay trainable;
+        # keep attention/norm/embed frozen (paper App.B, minimal change).
+        wrapper.student.requires_grad_(False)
+        for n, p in wrapper.student.named_parameters():
+            if any(k in n for k in list(cfg.target_modules or [])):
+                p.requires_grad_(True)
     else:
         wrapper.student.requires_grad_(False)
         for n, p in wrapper.student.named_parameters():
@@ -183,14 +239,14 @@ def _prepare_model_impl(args, model, branch: str):
     except Exception:
         teacher = deepcopy(student)
     teacher.eval()
-    meta = _build_factorized_student(student, teacher, cfg, with_perp=(branch == "core"))
+    meta = _build_factorized_student(student, teacher, cfg, branch=branch)
     wrapper = _TwydWrapper(student, teacher, cfg)
     wrapper.twyd_meta = meta
     _freeze_for_branch(wrapper, cfg)
     return wrapper
 
 
-class DenseLRCAdapter:
+class DenseLRCAdapter(_TunerBase):
     branch = "dense"
 
     @staticmethod
@@ -204,10 +260,18 @@ class DenseLRCAdapter:
 
     @staticmethod
     def from_pretrained(model, model_id, **kwargs):
-        return model
+        # Deployable ckpt is already merged HF format; load directly.
+        try:
+            from transformers import AutoModelForCausalLM
+            import torch as _t
+            loaded = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=getattr(model, "dtype", _t.bfloat16), trust_remote_code=True)
+            return loaded
+        except Exception:
+            return model
 
 
-class CoreLRCAdapter:
+class CoreLRCAdapter(_TunerBase):
     branch = "core"
 
     @staticmethod
@@ -221,10 +285,10 @@ class CoreLRCAdapter:
 
     @staticmethod
     def from_pretrained(model, model_id, **kwargs):
-        return model
+        return DenseLRCAdapter.from_pretrained(model, model_id, **kwargs)
 
 
-class PlainLRCAdapter:
+class PlainLRCAdapter(_TunerBase):
     branch = "plain"
 
     @staticmethod

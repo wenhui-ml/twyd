@@ -15,17 +15,31 @@ import os
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
+
+
+def _text_cfg(cfg):
+    return getattr(cfg, "text_config", cfg)
 
 
 def build_student_from_teacher(teacher, r: int):
     import copy
     cfg = copy.deepcopy(teacher.config)
-    cfg.hidden_size = r
-    cfg.intermediate_size = teacher.config.intermediate_size  # inherit d_ff (LRC style)
-    cfg.num_attention_heads = max(4, teacher.config.num_attention_heads // 2)
-    cfg.num_key_value_heads = max(2, teacher.config.num_key_value_heads // 2)
-    student = AutoModelForCausalLM.from_config(cfg)
+    tc = _text_cfg(teacher.config)
+    # LRC style: inherit d_ff, halve hidden/heads
+    try:
+        cfg.hidden_size = r
+    except Exception:
+        pass
+    if hasattr(cfg, "text_config") and cfg.text_config is not None:
+        cfg.text_config.hidden_size = r
+        cfg.text_config.num_attention_heads = max(4, tc.num_attention_heads // 2)
+        cfg.text_config.num_key_value_heads = max(2, tc.num_key_value_heads // 2)
+    else:
+        cfg.hidden_size = r
+        cfg.num_attention_heads = max(4, tc.num_attention_heads // 2)
+        cfg.num_key_value_heads = max(2, tc.num_key_value_heads // 2)
+    student = AutoModel.from_config(cfg)
     # inherit sliced weights where shapes allow (dense warm start at merged LRC point)
     with torch.no_grad():
         tsd = dict(teacher.named_parameters())
@@ -71,13 +85,26 @@ def main():
     tok = AutoTokenizer.from_pretrained(local_teacher, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    teacher = AutoModelForCausalLM.from_pretrained(
-        local_teacher, dtype=torch.bfloat16, trust_remote_code=True).to(args.device).eval()
+    try:
+        teacher = AutoModel.from_pretrained(
+            local_teacher, dtype=torch.bfloat16,
+            trust_remote_code=True).to(args.device).eval()
+    except Exception:
+        from transformers import Qwen3VLForConditionalGeneration
+        teacher = Qwen3VLForConditionalGeneration.from_pretrained(
+            local_teacher, dtype=torch.bfloat16,
+            trust_remote_code=True).to(args.device).eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
     student = build_student_from_teacher(teacher, args.student_hidden).to(torch.bfloat16).to(args.device).train()
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr)
-    vocab = teacher.config.vocab_size
+    tcfg = _text_cfg(teacher.config)
+    vocab = getattr(tcfg, "vocab_size", None) or getattr(teacher.config, "vocab_size", None)
+    if vocab is None:
+        try:
+            vocab = teacher.get_output_embeddings().weight.shape[0]
+        except Exception:
+            vocab = tok.vocab_size
     log = []
     for step in range(1, args.steps + 1):
         ids = torch.randint(0, vocab, (args.batch, args.seq_len), device=args.device)

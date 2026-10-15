@@ -2,7 +2,7 @@
 import torch
 
 from twyd.core_basis import build_core_basis, check_basis
-from twyd.init import ridge_zcol
+from twyd.init import build_outlier_aware_P, ridge_zcol
 from twyd.tuner import CoreLinear
 
 
@@ -80,4 +80,75 @@ def test_lrc_loss_forward_smoke():
     out = type("O", (), {"logits": torch.randn(B, S, V)})()
     labels = torch.randint(0, V, (B, S))
     val = loss_fn(out, labels)
-    assert torch.isfinite(val) and float(val) > 0
+    assert torch.isfinite(val) and float(val.detach()) > 0
+
+
+def test_dense_branch_param_count_and_init():
+    from twyd.tuner import _build_factorized_student
+    from twyd.config import TwydLRCConfig
+    torch.manual_seed(0)
+    H, d_ff, r = 24, 64, 12
+
+    class FakeMLP(torch.nn.Module):
+        def __init__(self, in_f, out_f):
+            super().__init__()
+            self.gate_proj = torch.nn.Linear(in_f, out_f, bias=False)
+
+    teacher = FakeMLP(H, d_ff)
+    student = FakeMLP(r, d_ff)
+    # fake configs
+    teacher.config = type("C", (), {"hidden_size": H})()
+    student.config = type("C", (), {"hidden_size": r})()
+    cfg = TwydLRCConfig(branch="dense", student_hidden=r, target_modules=["gate_proj"])
+    meta = _build_factorized_student(student, teacher, cfg, branch="dense")
+    assert "gate_proj" in meta and meta["gate_proj"]["is_dense"]
+    w = student.gate_proj.weight
+    assert tuple(w.shape) == (d_ff, r), tuple(w.shape)  # full deployed matrix
+    assert w.numel() == d_ff * r  # r*d_ff, not r*H
+
+
+def test_outlier_aware_P_passthrough():
+    torch.manual_seed(0)
+    N, H, r = 64, 24, 12
+    hidden = torch.randn(N, H) * 5
+    P, idx = build_outlier_aware_P(hidden, r, outlier_keep=4)
+    assert P.shape == (r, H) and len(idx) == 4
+    for i, ch in enumerate(idx):
+        assert P[i, ch] == 1.0
+
+
+def test_loss_uses_cached_teacher_inputs():
+    from twyd.loss import LrcDistillLoss
+
+    class FakeArgs:
+        tuner_kwargs = {"kl_temperature": 2.0, "kl_weight": 1.0,
+                        "ntp_weight": 1.0, "aux_weight": 0.0, "use_aux": False}
+
+    B, S, V = 1, 8, 32
+    s_logits = torch.randn(B, S, V)
+    t_logits = torch.randn(B, S, V)
+
+    class FakeTeacherOut:
+        def __init__(self, logits):
+            self.logits = logits
+
+    class FakeWrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.twyd_cfg = None
+            self._twyd_last_inputs = {"input_ids": torch.randint(0, V, (B, S))}
+
+        def get_teacher_outputs(self, **kw):
+            return FakeTeacherOut(t_logits)
+
+    class FakeTrainer:
+        def __init__(self):
+            self.model = FakeWrapper()
+            self._twyd_inputs = {}
+
+    loss_fn = LrcDistillLoss(FakeArgs(), FakeTrainer())
+    out = type("O", (), {"logits": s_logits})()
+    labels = torch.randint(0, V, (B, S))
+    val = loss_fn(out, labels)
+    assert torch.isfinite(val)
+    assert loss_fn.trainer._twyd_last["kl"] is not None, "KL must flow via cached inputs"
