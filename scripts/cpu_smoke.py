@@ -7,9 +7,12 @@ runs real model forward + LrcDistillLoss + 10 Adam steps per branch.
 Checks: forward ok, KL/NTP finite, core Z_perp leaves 0, dense weight moves,
 plain trainable = r*H only, merged_state_dict deployable shapes.
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/chenwh/Papers/twyd")
+_ROOT = os.environ.get("TWYD_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import torch
 

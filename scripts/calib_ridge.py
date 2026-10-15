@@ -18,7 +18,9 @@ import json
 import os
 import sys
 
-sys.path.insert(0, "/home/chenwh/Papers/twyd")
+_ROOT = os.environ.get("TWYD_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import torch
 
