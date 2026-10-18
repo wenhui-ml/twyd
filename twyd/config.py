@@ -32,6 +32,8 @@ class TwydLRCConfig:
     aux_loss_type: str = "mseloss"
     ridge_lambda: Optional[float] = None
     outlier_keep: int = 0
+    lora_rank: int = 0          # 0 = full dense-lrc (no LoRA); >0 = LoRA-Dense-LRC
+    lora_alpha: float = 16.0    # LoRA scaling = alpha / rank
 
     def validate(self) -> None:
         assert self.branch in ("dense", "core", "plain"), f"branch={self.branch}"

@@ -13,8 +13,20 @@ from safetensors.torch import save_file
 def merged_state_dict(model) -> dict:
     student = getattr(model, "student", model)
     out = {}
+    # Modules that expose merged_weight (CoreLinear, DenseLinearLoRA) fold all
+    # their trainable params (z_col/z_perp or lora_A/lora_B) into one deployed
+    # weight; skip those params here so they aren't saved twice or separately.
+    merged_mod_names = set()
+    for mod_name, mod in student.named_modules():
+        if mod_name == "":
+            continue
+        if callable(getattr(mod, "merged_weight", None)):
+            merged_mod_names.add(mod_name)
     for n, p in student.named_parameters():
         if ".z_col" in n or ".z_perp" in n or "basis_" in n:
+            continue
+        mod_name = n.rsplit(".", 1)[0] if "." in n else ""
+        if mod_name in merged_mod_names:
             continue
         out[n] = p.detach().cpu()
     for mod_name, mod in student.named_modules():

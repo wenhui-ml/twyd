@@ -44,7 +44,50 @@ class CoreLinear(nn.Module):
         return nn.functional.linear(x, self.merged_weight())
 
 
+class DenseLinearLoRA(nn.Module):
+    """LoRA-wrapped dense linear for Train-What-You-Deploy.
+
+    W = base_weight(frozen) + (lora_A @ lora_B) * (alpha / rank)
+
+    base_weight is a buffer (no grad, no optimizer state); only lora_A / lora_B
+    are trainable. merged_weight() returns the full deployed W for export, so
+    inference stays a single dense matmul (zero extra latency).
+    """
+    def __init__(self, in_features: int, out_features: int,
+                 lora_rank: int = 64, lora_alpha: float = 16.0,
+                 base_weight: Optional[torch.Tensor] = None, bias: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.lora_rank = int(lora_rank)
+        self.scaling = float(lora_alpha) / self.lora_rank if self.lora_rank > 0 else 0.0
+
+        if base_weight is not None:
+            self.register_buffer("base_weight", base_weight.detach().contiguous())
+        else:
+            self.register_buffer("base_weight", torch.empty(out_features, in_features))
+
+        if self.lora_rank > 0:
+            self.lora_A = nn.Parameter(torch.empty(out_features, self.lora_rank))
+            self.lora_B = nn.Parameter(torch.empty(self.lora_rank, in_features))
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+
+    def merged_weight(self) -> torch.Tensor:
+        W = self.base_weight
+        if self.lora_rank > 0:
+            W = W + (self.lora_A @ self.lora_B) * self.scaling
+        return W
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.linear(x, self.merged_weight())
+
+
 from copy import deepcopy
+import math
 from typing import Dict, List
 
 from .core_basis import build_core_basis
@@ -346,6 +389,8 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
     """
     with_perp = (branch == "core")
     is_dense = (branch == "dense")
+    lora_rank = int(getattr(cfg, "lora_rank", 0) or 0)
+    lora_alpha = float(getattr(cfg, "lora_alpha", 16.0) or 16.0)
     tcfg = getattr(teacher, "config", None)
     teacher_hidden = int(getattr(tcfg, "hidden_size", getattr(getattr(tcfg, "text_config", None), "hidden_size", 0)) or 0)
     if teacher_hidden == 0:
@@ -376,9 +421,14 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                 Z_col = (T.T @ s_w).T.contiguous()
                 W0 = (T @ Z_col.T).contiguous()  # merged plain weight d_ff x r
                 if is_dense:
-                    new_mod = nn.Linear(r, d_ff, bias=False)
-                    with torch.no_grad():
-                        new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
+                    if lora_rank > 0:
+                        new_mod = DenseLinearLoRA(r, d_ff, lora_rank=lora_rank,
+                                                   lora_alpha=lora_alpha,
+                                                   base_weight=W0)
+                    else:
+                        new_mod = nn.Linear(r, d_ff, bias=False)
+                        with torch.no_grad():
+                            new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
                     Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
                     new_mod = CoreLinear(T, Z_col, P if with_perp else None,
@@ -395,9 +445,14 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                 Z_col = (s_w @ R.T).contiguous()
                 W0 = (Z_col @ R).contiguous()  # merged plain weight r x d_ff
                 if is_dense:
-                    new_mod = nn.Linear(d_ff, r, bias=False)
-                    with torch.no_grad():
-                        new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
+                    if lora_rank > 0:
+                        new_mod = DenseLinearLoRA(d_ff, r, lora_rank=lora_rank,
+                                                   lora_alpha=lora_alpha,
+                                                   base_weight=W0)
+                    else:
+                        new_mod = nn.Linear(d_ff, r, bias=False)
+                        with torch.no_grad():
+                            new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
                     Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
                     new_mod = CoreLinear(R, Z_col, Vp if with_perp else None,
@@ -406,7 +461,9 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
         # the device/dtype of the linear it replaces.
         setattr(parent, attr, new_mod.to(device=lin_dev, dtype=lin_dt))
         meta[mod_name] = {"side": side, "d_ff": d_ff, "H": H, "r": r,
-                          "with_perp": with_perp, "is_dense": is_dense, "branch": cfg.branch}
+                          "with_perp": with_perp, "is_dense": is_dense,
+                          "branch": cfg.branch, "lora_rank": lora_rank,
+                          "lora_alpha": lora_alpha}
     return meta
 
 
@@ -597,6 +654,8 @@ def _twyd_kw(args) -> dict:
         "target_modules": _os.environ.get("TWYD_TARGET_MODULES", None),
         "outlier_keep": _os.environ.get("TWYD_OUTLIER_KEEP", None),
         "ridge_lambda": _os.environ.get("TWYD_RIDGE_LAMBDA", None),
+        "lora_rank": _os.environ.get("TWYD_LORA_RANK", None),
+        "lora_alpha": _os.environ.get("TWYD_LORA_ALPHA", None),
     }
     for k, v in env_map.items():
         if v is None or (isinstance(v, str) and v == ""):
@@ -609,10 +668,16 @@ def _twyd_kw(args) -> dict:
         except Exception:
             return x
 
-    for k in ("student_hidden", "outlier_keep"):
+    for k in ("student_hidden", "outlier_keep", "lora_rank"):
         if k in kw and isinstance(kw[k], str):
             try:
                 kw[k] = int(kw[k])
+            except Exception:
+                pass
+    for k in ("lora_alpha",):
+        if k in kw and isinstance(kw[k], str):
+            try:
+                kw[k] = float(kw[k])
             except Exception:
                 pass
     for k in ("kl_temperature", "kl_weight", "ntp_weight", "aux_weight", "ridge_lambda"):
@@ -647,7 +712,9 @@ def _prepare_model_impl(args, model, branch: str):
               use_aux=kw.get("use_aux", True),
               aux_loss_type=kw.get("aux_loss_type", "mseloss"),
               ridge_lambda=kw.get("ridge_lambda"),
-              outlier_keep=kw.get("outlier_keep", 0))
+              outlier_keep=kw.get("outlier_keep", 0),
+              lora_rank=kw.get("lora_rank", 0),
+              lora_alpha=kw.get("lora_alpha", 16.0))
     cfg.validate()
     teacher_id = cfg.teacher_model or getattr(args, "model", None)
     if teacher_id is None:

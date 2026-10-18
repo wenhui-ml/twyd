@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 outputs/
 ckpts/
+_upstream/ms-swift/ms_swift.egg-info/
+data/
+output/
+twyd.egg-info/
