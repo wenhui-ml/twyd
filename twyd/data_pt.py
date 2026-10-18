@@ -118,23 +118,22 @@ try:
     from swift.dataset import DatasetMeta, RowPreprocessor, register_dataset
 
     class TwydPTPreprocessor(RowPreprocessor):
-        """Concat raw texts (eos+text+bos, no special tokens) into chunks."""
+        """Emit PT rows as single assistant messages (loss_scale=all in PT).
 
-        prompt = "text"
+        Parent ResponsePreprocessor maps text->response but requires a query;
+        PT has no query/response split, so emit messages directly. The PT
+        template (use_chat_template=False, loss_scale=all) then supervises
+        every token, matching labels==input_ids.
+        """
 
         def preprocess(self, row: dict) -> Optional[dict]:
-            # RowPreprocessor works row-wise; chunking state lives on self and
-            # is flushed by prompt_format / dataset packing downstream. We emit
-            # one packed-text row per input and let swift's packing (or our
-            # offline script for exact LRC parity) cut fixed chunks.
             text = row.get("text", None)
             if not isinstance(text, str) or not text.strip():
                 return None
             eos = getattr(self, "_twyd_eos", None) or ""
             bos = getattr(self, "_twyd_bos", None) or ""
-            # Keep delimiters as literal text here; tokenization adds no
-            # special tokens (mirrors offline tokenize_lrc_style).
-            return {"text": f"{eos}{text}{bos}"}
+            full = f"{eos}{text}{bos}"
+            return {"messages": [{"role": "assistant", "content": full}]}
 
     register_dataset(DatasetMeta(
         ms_dataset_id="twyd_pt",

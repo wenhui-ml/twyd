@@ -86,12 +86,34 @@ class _TwydWrapper(nn.Module):
     def __init__(self, student: nn.Module, teacher: nn.Module, cfg):
         super().__init__()
         self.student = student
-        self.teacher = teacher
+        # Teacher must NOT be a registered submodule: DataParallel.replicate
+        # walks _parameters/_modules and chokes on the duplicated (tied /
+        # shared-storage) teacher tensors. Keep it as a plain attribute.
+        object.__setattr__(self, "teacher", teacher)
         for p in self.teacher.parameters():
             p.requires_grad_(False)
         self.teacher.eval()
         self.twyd_cfg = cfg
         self.config = getattr(student, "config", None)
+
+    def state_dict(self, *args, **kwargs):
+        sd = self.student.state_dict(*args, **kwargs)
+        # Tied embeddings (Llama-3.2 tie_word_embeddings=true) put both
+        # `model.embed_tokens.weight` and `lm_head.weight` on one storage;
+        # the raw safetensors save_file path swift uses for plain wrappers
+        # rejects shared storages. Clone duplicates: the values are
+        # identical, and from_pretrained re-ties them harmlessly.
+        seen = set()
+        for k in list(sd.keys()):
+            v = sd[k]
+            if not torch.is_tensor(v) or v.numel() == 0:
+                continue
+            ptr = v.data_ptr()
+            if ptr in seen:
+                sd[k] = v.detach().clone()
+            else:
+                seen.add(ptr)
+        return sd
 
     # --- ms-swift / HF attribute delegation (read-only -> student) ---
     def __getattr__(self, name: str):
@@ -111,8 +133,18 @@ class _TwydWrapper(nn.Module):
         passthrough = (
             "model_meta", "model_dir", "model_info", "model_type",
             "generation_config", "origin_generation_config",
-            "hf_device_map", "dtype", "name_or_path",
+            "dtype", "name_or_path",
         )
+        if name == "hf_device_map":
+            # accelerate.verify_device_map does len(m.hf_device_map); empty
+            # dict = single-device, no dispatch. Never return None.
+            try:
+                dm = getattr(student, "hf_device_map", None)
+                if isinstance(dm, dict) and dm:
+                    return dm
+            except Exception:
+                pass
+            return {}
         if name in passthrough:
             return getattr(student, name, None)
         if name in ("base_model", "model"):
@@ -158,6 +190,16 @@ class _TwydWrapper(nn.Module):
 
     def gradient_checkpointing_disable(self, *args, **kwargs):
         fn = getattr(self.student, "gradient_checkpointing_disable", None)
+        if fn is not None:
+            return fn(*args, **kwargs)
+
+    def enable_input_require_grads(self, *args, **kwargs):
+        fn = getattr(self.student, "enable_input_require_grads", None)
+        if fn is not None:
+            return fn(*args, **kwargs)
+
+    def disable_input_require_grads(self, *args, **kwargs):
+        fn = getattr(self.student, "disable_input_require_grads", None)
         if fn is not None:
             return fn(*args, **kwargs)
 
@@ -315,17 +357,18 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
         lin: nn.Linear = getattr(parent, attr)
         try:
             t_parent, _ = _get_parent(teacher, mod_name)
-            t_weight = getattr(t_parent, attr).weight.detach()
+            t_weight = getattr(t_parent, attr).weight.detach().cpu()
         except Exception:
             continue
         short = mod_name.split(".")[-1]
         is_down = (short == "down_proj" or "down" in short or short in ("w2", "c_proj"))
+        lin_dev, lin_dt = lin.weight.device, lin.weight.dtype
         with torch.no_grad():
             if not is_down:
                 d_ff, H = t_weight.shape
                 side = "left"
                 T, P = build_core_basis(t_weight, "left")
-                s_w = lin.weight.detach().to(torch.float32)
+                s_w = lin.weight.detach().to(torch.float32).cpu()
                 if s_w.shape != (d_ff, r):
                     tmp = torch.zeros(d_ff, r)
                     tmp[:, :min(r, s_w.shape[1])] = s_w[:d_ff, :min(r, s_w.shape[1])]
@@ -344,7 +387,7 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                 H, d_ff = t_weight.shape
                 side = "right"
                 R, Vp = build_core_basis(t_weight, "right")
-                s_w = lin.weight.detach().to(torch.float32)
+                s_w = lin.weight.detach().to(torch.float32).cpu()
                 if s_w.shape != (r, d_ff):
                     tmp = torch.zeros(r, d_ff)
                     tmp[:min(r, s_w.shape[0]), :] = s_w[:min(r, s_w.shape[0]), :d_ff]
@@ -359,7 +402,9 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                     Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
                     new_mod = CoreLinear(R, Z_col, Vp if with_perp else None,
                                          Z_perp, side="right", with_perp=with_perp)
-        setattr(parent, attr, new_mod.to(dtype=lin.weight.dtype))
+        # basis algebra ran on CPU fp32; move the rebuilt module back onto
+        # the device/dtype of the linear it replaces.
+        setattr(parent, attr, new_mod.to(device=lin_dev, dtype=lin_dt))
         meta[mod_name] = {"side": side, "d_ff": d_ff, "H": H, "r": r,
                           "with_perp": with_perp, "is_dense": is_dense, "branch": cfg.branch}
     return meta
@@ -445,9 +490,150 @@ def _resolve_teacher(student: nn.Module, teacher_id: str) -> nn.Module:
     return teacher.eval()
 
 
+def _hidden_of(mod: nn.Module) -> int:
+    cfg = getattr(mod, "config", None)
+    tc = getattr(cfg, "text_config", None) or cfg
+    try:
+        return int(getattr(tc, "hidden_size", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _shrink_student_(student: nn.Module, teacher: nn.Module, r: int) -> nn.Module:
+    """Replace a full-width student with a width-r LRC student (slice init).
+
+    TWYD trains the deployed width-reduced model: hidden r, d_ff inherited from
+    the teacher, heads = r / head_dim (LowRankClone target_hidden_size style;
+    scripts/train_dense_standalone.py:build_student_from_teacher is the
+    reference). Warm start = slice the teacher weights (warm_start='slice').
+    Swift-set attrs (model_meta/model_dir/...) are carried onto the new model
+    so the stock swift pt/sft loop keeps working.
+    """
+    old_cfg = getattr(student, "config", None)
+    tc = getattr(old_cfg, "text_config", None) or old_cfg
+    H = _hidden_of(student)
+    heads = int(getattr(tc, "num_attention_heads", 8) or 8)
+    kv = int(getattr(tc, "num_key_value_heads", None) or heads)
+    head_dim = int(getattr(tc, "head_dim", None) or ((H // heads) if heads else 64))
+    if head_dim <= 0 or r % head_dim != 0:
+        raise ValueError(
+            f"[twyd] student_hidden r={r} not divisible by head_dim={head_dim}; "
+            "pick TWYD_R that is a multiple of the teacher head_dim")
+    new_heads = r // head_dim
+    # KV heads must divide query heads for GQA (SDPA requirement). Pick the
+    # largest divisor of new_heads that does not exceed the teacher's kv heads.
+    _kv_cap = min(kv, new_heads)
+    new_kv = next((d for d in range(_kv_cap, 0, -1) if new_heads % d == 0), 1)
+    cfg = deepcopy(old_cfg)
+    target = getattr(cfg, "text_config", None)
+    target = target if target is not None else cfg
+    target.hidden_size = r
+    target.num_attention_heads = new_heads
+    if getattr(target, "num_key_value_heads", None):
+        target.num_key_value_heads = new_kv
+    from transformers import AutoModelForCausalLM
+    try:
+        new = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.bfloat16)
+    except TypeError:
+        new = AutoModelForCausalLM.from_config(cfg)
+    with torch.no_grad():
+        tsd = dict(teacher.named_parameters())
+        for n, p in new.named_parameters():
+            t = tsd.get(n)
+            if t is None:
+                continue
+            if t.dim() != p.dim() or any(ps > tsz for ps, tsz in zip(p.shape, t.shape)):
+                continue
+            idx = tuple(slice(0, s) for s in p.shape)
+            try:
+                p.copy_(t[idx].to(p.dtype))
+            except Exception:
+                continue
+    # carry swift attrs from the old student (plain attrs, not params/modules)
+    for attr in ("model_meta", "model_dir", "model_info", "model_type",
+                 "name_or_path"):
+        if attr in student.__dict__:
+            setattr(new, attr, student.__dict__[attr])
+    for attr in ("generation_config", "origin_generation_config"):
+        if attr in student.__dict__:
+            try:
+                setattr(new, attr, deepcopy(student.__dict__[attr]))
+            except Exception:
+                pass
+    try:
+        ref = next(student.parameters())
+        new = new.to(device=ref.device, dtype=ref.dtype)
+    except StopIteration:
+        pass
+    print(f"[twyd] width shrink: student hidden {H} -> {r} "
+          f"(heads {heads}->{new_heads}, kv {kv}->{new_kv}, d_ff inherited)")
+    return new
+
+
+def _twyd_kw(args) -> dict:
+    """Read twyd hyper-params.
+
+    Priority: TWYD_* env vars > legacy args.tuner_kwargs dict (old swift).
+    New swift (4.x) has no tuner_kwargs field, so env vars are canonical:
+      TWYD_TEACHER, TWYD_R, TWYD_STAGE, TWYD_WARM_START, TWYD_PT_CKPT,
+      TWYD_T, TWYD_WKL, TWYD_WNTP, TWYD_LAM, TWYD_USE_AUX,
+      TWYD_TARGET_MODULES (comma-separated), TWYD_OUTLIER_KEEP,
+      TWYD_RIDGE_LAMBDA, TWYD_MAX_AUX_LAYERS.
+    """
+    import os as _os
+
+    kw = dict(getattr(args, "tuner_kwargs", None) or {})
+    env_map = {
+        "teacher_model": _os.environ.get("TWYD_TEACHER", None),
+        "student_hidden": _os.environ.get("TWYD_R", None),
+        "stage": _os.environ.get("TWYD_STAGE", None),
+        "warm_start": _os.environ.get("TWYD_WARM_START", None),
+        "pt_ckpt": _os.environ.get("TWYD_PT_CKPT", None),
+        "kl_temperature": _os.environ.get("TWYD_T", None),
+        "kl_weight": _os.environ.get("TWYD_WKL", None),
+        "ntp_weight": _os.environ.get("TWYD_WNTP", None),
+        "aux_weight": _os.environ.get("TWYD_LAM", None),
+        "use_aux": _os.environ.get("TWYD_USE_AUX", None),
+        "target_modules": _os.environ.get("TWYD_TARGET_MODULES", None),
+        "outlier_keep": _os.environ.get("TWYD_OUTLIER_KEEP", None),
+        "ridge_lambda": _os.environ.get("TWYD_RIDGE_LAMBDA", None),
+    }
+    for k, v in env_map.items():
+        if v is None or (isinstance(v, str) and v == ""):
+            continue
+        kw[k] = v
+    # Type coercion for env-sourced strings.
+    def _num(x, f=float):
+        try:
+            return f(x)
+        except Exception:
+            return x
+
+    for k in ("student_hidden", "outlier_keep"):
+        if k in kw and isinstance(kw[k], str):
+            try:
+                kw[k] = int(kw[k])
+            except Exception:
+                pass
+    for k in ("kl_temperature", "kl_weight", "ntp_weight", "aux_weight", "ridge_lambda"):
+        if k in kw and isinstance(kw[k], str):
+            kw[k] = _num(kw[k])
+    if "use_aux" in kw and isinstance(kw["use_aux"], str):
+        kw["use_aux"] = kw["use_aux"].strip().lower() not in ("0", "false", "no", "off")
+    if "target_modules" in kw and isinstance(kw["target_modules"], str):
+        kw["target_modules"] = [s.strip() for s in kw["target_modules"].split(",") if s.strip()]
+    mx = _os.environ.get("TWYD_MAX_AUX_LAYERS", None)
+    if mx is not None and mx != "":
+        try:
+            kw["max_aux_layers"] = int(mx)
+        except Exception:
+            pass
+    return kw
+
+
 def _prepare_model_impl(args, model, branch: str):
     from .config import TwydLRCConfig as Cfg
-    kw = dict(getattr(args, "tuner_kwargs", None) or {})
+    kw = _twyd_kw(args)
     cfg = Cfg(branch=branch,
               teacher_model=kw.get("teacher_model"),
               student_hidden=kw.get("student_hidden"),
@@ -467,9 +653,20 @@ def _prepare_model_impl(args, model, branch: str):
     if teacher_id is None:
         raise ValueError("twyd needs tuner_kwargs.teacher_model")
     student = model
-    # SFT warm start: load merged PT ckpt into student BEFORE factorized rebuild,
-    # so Z_col/W0 inherit PT-learned weights instead of the raw slice init.
-    # Teacher for SFT stays the standard open-source teacher (teacher_model).
+    teacher = _resolve_teacher(student, teacher_id)
+    teacher.eval()
+    # Width shrink: TWYD trains the deployed width-r model. If the --model
+    # student is still full-width, rebuild it at hidden=r (slice warm start
+    # from the teacher) BEFORE the PT-ckpt warm start and factorized rebuild,
+    # so PT ckpt (width-r) tensors match and gate/up are (d_ff, r).
+    if not cfg.student_hidden:
+        cfg.student_hidden = max(64, _hidden_of(teacher) // 2)
+    r = int(cfg.student_hidden)
+    if _hidden_of(student) != r:
+        student = _shrink_student_(student, teacher, r)
+    # SFT warm start: load merged PT ckpt into the (possibly shrunk) student
+    # BEFORE factorized rebuild, so Z_col/W0 inherit PT-learned weights
+    # instead of the raw slice init. Teacher for SFT stays the open teacher.
     pt_ckpt = kw.get("pt_ckpt", None)
     if cfg.stage == "sft" and cfg.warm_start == "pt_ckpt" and pt_ckpt:
         try:
@@ -477,8 +674,6 @@ def _prepare_model_impl(args, model, branch: str):
             print(f"[twyd] SFT warm start: loaded {n} tensors from PT ckpt {pt_ckpt}")
         except Exception as e:
             print(f"[twyd] SFT warm start failed ({e}); falling back to slice init")
-    teacher = _resolve_teacher(student, teacher_id)
-    teacher.eval()
     meta = _build_factorized_student(student, teacher, cfg, branch=branch)
     wrapper = _TwydWrapper(student, teacher, cfg)
     wrapper.twyd_meta = meta

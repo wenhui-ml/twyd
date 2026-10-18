@@ -20,7 +20,11 @@ class LrcDistillLoss(_BaseLoss):
         except Exception:
             self.args = args
             self.trainer = trainer
-        kw = dict(getattr(args, "tuner_kwargs", None) or {})
+        try:
+            from .tuner import _twyd_kw
+            kw = dict(_twyd_kw(args))
+        except Exception:
+            kw = dict(getattr(args, "tuner_kwargs", None) or {})
         self.kw = kw
         self.T = float(kw.get("kl_temperature", 40.0))
         self.wKL = float(kw.get("kl_weight", 1.0))
