@@ -21,6 +21,8 @@ class TwydLRCConfig:
     branch: str = "core"
     teacher_model: Optional[str] = None
     student_hidden: Optional[int] = None
+    stage: str = "pt"
+    warm_start: str = "slice"
     target_modules: List[str] = field(default_factory=lambda: ["gate_proj", "up_proj", "down_proj"])
     kl_temperature: float = 40.0
     kl_weight: float = 1.0
@@ -34,3 +36,5 @@ class TwydLRCConfig:
     def validate(self) -> None:
         assert self.branch in ("dense", "core", "plain"), f"branch={self.branch}"
         assert self.aux_loss_type in ("mseloss", "l1"), self.aux_loss_type
+        assert self.stage in ("pt", "sft"), f"stage={self.stage}"
+        assert self.warm_start in ("slice", "pt_ckpt"), f"warm_start={self.warm_start}"

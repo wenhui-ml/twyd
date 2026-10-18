@@ -26,6 +26,12 @@ try:
                         trainer._twyd_inputs = keep
                 except Exception:
                     pass
+
+        # transformers Trainer calls training_step with inputs positionally;
+        # on_step_begin has no inputs param, so also hook on_train_batch_start
+        # variants where available. Wrapper cache remains the primary path.
+        def on_train_batch_start(self, args, state, control, **kwargs):
+            return self.on_step_begin(args, state, control, **kwargs)
 except Exception:  # transformers not available at import time
     TwydInputCacheCallback = None  # type: ignore
 

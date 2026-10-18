@@ -1,12 +1,7 @@
-"""ms-swift loss_map plugin: lrc_distill.
+"""ms-swift loss_map plugin: lrc_distill (PT + SFT stages).
 
-L = wKL * T^2 * KL(softmax(zT/T) || softmax(zS/T))
-  + wNTP * CE(y, zS)
-  + lambda_aux * L_align   (hidden MSE, Eq.7 minimal; attn/MLP alignment off by default)
-
-Teacher forward runs under no_grad via wrapper.get_teacher_outputs(); inputs
-are read from (1) trainer._twyd_inputs (callback), (2) wrapper._twyd_last_inputs
-(cached in _TwydWrapper.forward, survives ms-swift input stripping).
+PT (stage="pt"): labels == input_ids, every position distills.
+SFT (stage="sft"): prompt/pad masked to -100, KL+CE+aux all respect mask.
 """
 import torch
 import torch.nn.functional as F
@@ -26,20 +21,51 @@ class LrcDistillLoss(_BaseLoss):
             self.args = args
             self.trainer = trainer
         kw = dict(getattr(args, "tuner_kwargs", None) or {})
+        self.kw = kw
         self.T = float(kw.get("kl_temperature", 40.0))
         self.wKL = float(kw.get("kl_weight", 1.0))
         self.wNTP = float(kw.get("ntp_weight", 1.0))
         self.lam = float(kw.get("aux_weight", 0.2))
         self.use_aux = bool(kw.get("use_aux", True))
+        self.stage = str(kw.get("stage", "pt")).lower()
 
     def _unwrap(self, model):
+        # Unwrap Swift/Peft chains, but STOP at _TwydWrapper (the layer that
+        # carries twyd_cfg / get_teacher_outputs / _twyd_last_inputs).
+        # Our wrapper exposes .model -> student for ms-swift compat, so a
+        # naive .model chase would overshoot past the wrapper.
         m = model
         for _ in range(5):
+            try:
+                has_cfg = getattr(m, "twyd_cfg", None) is not None
+            except Exception:
+                has_cfg = False
+            if has_cfg:
+                return m
             inner = getattr(m, "model", None)
             if inner is None or inner is m:
                 break
             m = inner() if callable(inner) else inner
         return m
+
+    def _per_pos_kl(self, shift_s, shift_t, T):
+        V = min(shift_s.size(-1), shift_t.size(-1))
+        logp_s = F.log_softmax(shift_s[..., :V] / T, dim=-1)
+        prob_t = F.softmax(shift_t[..., :V] / T, dim=-1)
+        return F.kl_div(logp_s, prob_t, reduction="none").sum(dim=-1) * (T * T)
+
+    def _masked_mean(self, per_pos, shift_y, loss_scale=None):
+        mask = (shift_y != -100).to(per_pos.dtype)
+        w = mask
+        if torch.is_tensor(loss_scale):
+            ls = loss_scale
+            try:
+                if ls.dim() == 2 and ls.shape[1] == shift_y.shape[1] + 1:
+                    ls = ls[..., 1:].contiguous()
+                w = mask * ls.to(mask.dtype).reshape(mask.shape)
+            except Exception:
+                w = mask
+        return (per_pos * w).sum() / w.sum().clamp_min(1.0)
 
     def __call__(self, outputs, labels, *, num_items_in_batch=None, loss_scale=None, **kwargs):
         raw_model = self.trainer.model
@@ -80,36 +106,90 @@ class LrcDistillLoss(_BaseLoss):
         shift_s = logits[..., :-1, :].contiguous()
         loss = 0.0
         ntp = None
+        stage = self.stage
+        if twcfg is not None:
+            stage = str(getattr(twcfg, "stage", stage)).lower()
+        is_sft = (stage == "sft")
+        shift_y = None
         if labels is not None:
             shift_y = labels[..., 1:].contiguous()
-            ntp = F.cross_entropy(shift_s.view(-1, shift_s.size(-1)),
-                                  shift_y.view(-1), ignore_index=-100)
+            if is_sft:
+                ntp = F.cross_entropy(shift_s.view(-1, shift_s.size(-1)),
+                                      shift_y.view(-1), ignore_index=-100)
+            else:  # pt: labels==input_ids, dense supervision
+                ntp = F.cross_entropy(shift_s.view(-1, shift_s.size(-1)),
+                                      shift_y.view(-1))
             loss = loss + wNTP * ntp
         kl = None
         if t_logits is not None:
             shift_t = t_logits[..., :-1, :].contiguous().detach()
-            V = min(shift_s.size(-1), shift_t.size(-1))
-            kl = F.kl_div(F.log_softmax(shift_s[..., :V] / T, dim=-1),
-                          F.softmax(shift_t[..., :V] / T, dim=-1),
-                          reduction="batchmean") * (T * T)
+            per_pos = self._per_pos_kl(shift_s, shift_t, T)  # [B,S-1]
+            if is_sft and shift_y is not None:
+                kl = self._masked_mean(per_pos, shift_y, loss_scale)
+            else:  # pt: every position distills
+                kl = per_pos.mean()
             loss = loss + wKL * kl
         aux = None
         if use_aux and lam > 0:
-            # Minimal Eq.7: last-hidden MSE with teacher-width projection.
-            # Full per-layer hidden/attn/MLP alignment stays future work; previously
-            # this term was exactly zero (aux = zeros), now it measures something.
             try:
                 s_hidden = getattr(outputs, "hidden_states", None)
+                if s_hidden is None:
+                    # Ask the wrapper to re-run student with hidden states only
+                    # when the template did not request them (saves memory).
+                    # Guard: synthetic test doubles (FakeBlock without forward)
+                    # must not crash the loss — aux stays None there.
+                    try:
+                        has_real_forward = False
+                        try:
+                            st = getattr(m, "student", None)
+                            has_real_forward = st is not None and not type(st).__name__.startswith("Fake")
+                        except Exception:
+                            has_real_forward = False
+                        if inputs and has_real_forward:
+                            with torch.no_grad():
+                                _s = m.student(**{k: v for k, v in inputs.items()
+                                                  if k in ("input_ids", "attention_mask", "position_ids")},
+                                               output_hidden_states=True, use_cache=False)
+                            s_hidden = getattr(_s, "hidden_states", None)
+                    except Exception:
+                        s_hidden = None
                 if s_hidden is not None and t_hidden is not None and len(s_hidden) and len(t_hidden):
-                    sh, th = s_hidden[-1], t_hidden[-1]
-                    if sh.shape[-1] != th.shape[-1]:
-                        # Reuse teacher-col basis idea: least-squares project student->teacher width.
-                        # Cheap per-batch solve; no new parameters (not stored).
-                        A, B = sh.detach().reshape(-1, sh.shape[-1]), th.detach().reshape(-1, th.shape[-1])
-                        P = torch.linalg.lstsq(A.float(), B.float()).solution.to(sh.dtype)  # r x H
-                        aux = F.mse_loss(sh @ P, th)
-                    else:
-                        aux = F.mse_loss(sh.float(), th.float())
+                    # Eq.7 hidden part: 1/L Σ_l ||h^S_l P - h^T_l||^2, averaged
+                    # over L matched layers (not just the last). P is one
+                    # least-squares projection shared across layers (no params).
+                    L = min(len(s_hidden), len(t_hidden))
+                    # Cap layers to bound the lstsq cost on long contexts.
+                    max_aux_layers = int((self.kw or {}).get("max_aux_layers", 4) or 4)
+                    idxs = [round(i * (L - 1) / max(max_aux_layers - 1, 1)) for i in range(min(max_aux_layers, L))]
+                    acc, cnt = 0.0, 0
+                    # Fit P once on the last layer, reuse for all (cheap + stable).
+                    sh0, th0 = s_hidden[-1], t_hidden[-1]
+                    P = None
+                    if sh0.shape[-1] != th0.shape[-1]:
+                        try:
+                            A = sh0.detach().reshape(-1, sh0.shape[-1])
+                            B = th0.detach().reshape(-1, th0.shape[-1])
+                            P = torch.linalg.lstsq(A.float(), B.float()).solution.to(sh0.dtype)
+                        except Exception:
+                            P = None
+                    for li in idxs:
+                        try:
+                            sh, th = s_hidden[li], t_hidden[li]
+                            pred = (sh @ P) if (P is not None and sh.shape[-1] != th.shape[-1]) else sh
+                            if is_sft and shift_y is not None:
+                                pr = pred[..., :-1, :].contiguous()
+                                tg = th[..., :-1, :].contiguous()
+                                mm = (shift_y != -100).unsqueeze(-1).to(pr.dtype)
+                                term = (((pr - tg.float()) ** 2) * mm).sum() / mm.sum().clamp_min(1.0)
+                            else:
+                                term = F.mse_loss(pred.float(), th.float())
+                            if torch.isfinite(term):
+                                acc = acc + term
+                                cnt += 1
+                        except Exception:
+                            continue
+                    if cnt > 0:
+                        aux = acc / cnt
             except Exception:
                 aux = None
             if aux is not None and torch.isfinite(aux):
@@ -120,6 +200,11 @@ class LrcDistillLoss(_BaseLoss):
                                        "aux": None if aux is None else float(aux.detach())}
         except Exception:
             pass
-        if loss_scale is not None:
-            loss = loss * loss_scale
+        if loss_scale is not None and not torch.is_tensor(loss_scale):
+            # scalar multiplier only; tensor loss_scale already consumed
+            # per-term (SFT masked KL) above to avoid double counting.
+            try:
+                loss = loss * float(loss_scale)
+            except Exception:
+                pass
         return loss

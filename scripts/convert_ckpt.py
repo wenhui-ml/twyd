@@ -13,6 +13,8 @@ def main():
     ap.add_argument("--ckpt", required=True, help="training output dir (has adapter weights)")
     ap.add_argument("--save", required=True)
     ap.add_argument("--base", default=None, help="optional student base HF id for config passthrough")
+    ap.add_argument("--stage", default="pt", choices=["pt", "sft"],
+                    help="pt: merged PT ckpt; sft: stage tag only (merge logic identical)")
     args = ap.parse_args()
     import torch
     from safetensors.torch import load_file

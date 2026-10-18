@@ -6,6 +6,9 @@ from .loss import LrcDistillLoss
 from .merge import merge_and_save, merged_state_dict
 from .tuner import CoreLinear, CoreLRCAdapter, DenseLRCAdapter, PlainLRCAdapter
 
+STAGE_PT = "pt"
+STAGE_SFT = "sft"
+
 __all__ = [
     "TwydLRCConfig",
     "build_core_basis",
@@ -20,5 +23,7 @@ __all__ = [
     "DenseLRCAdapter",
     "CoreLRCAdapter",
     "PlainLRCAdapter",
+    "STAGE_PT",
+    "STAGE_SFT",
 ]
 
