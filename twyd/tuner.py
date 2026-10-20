@@ -1,4 +1,5 @@
 """ms-swift Tuner plugins: DenseLRC / CoreLRC / PlainLRC (part 1: CoreLinear)."""
+import math
 import os
 from typing import Optional
 
@@ -39,6 +40,50 @@ class CoreLinear(nn.Module):
         if self.with_perp:
             W = W + self.z_perp @ self.basis_perp
         return W
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.linear(x, self.merged_weight())
+
+
+class CoreLinearLoRA(nn.Module):
+    """Low-rank CORE-LRC: Z_col full (+frozen), Z_perp = A_perp B_perp^T.
+
+    Prop.1 preserved: A_perp/B_perp zero-init => exactly plain-LRC at step 0.
+    merged_weight() folds both paths into one deployed matrix (zero latency).
+
+    left  (gate/up): W = T Z_col^T  + U_perp (A B^T)^T,  W: d_ff x r
+    right (down):    W = Z_col R    + (A B^T) V_perp,    W: r x d_ff
+    """
+
+    def __init__(self, T_or_R: torch.Tensor, Z_col: torch.Tensor,
+                 U_perp_or_V: torch.Tensor,
+                 lora_rank: int = 128, lora_alpha: float = 16.0,
+                 side: str = "left", freeze_col: bool = False):
+        super().__init__()
+        self.side = side
+        self.lora_rank = int(lora_rank)
+        self.freeze_col = bool(freeze_col)
+        self.with_perp = True
+        self.scaling = (float(lora_alpha) / float(lora_rank)) if lora_rank > 0 else 1.0
+        self.register_buffer("basis_col", T_or_R.detach().contiguous())
+        self.z_col = nn.Parameter(Z_col.detach().contiguous())
+        self.z_col.requires_grad_(not self.freeze_col)
+        self.register_buffer("basis_perp", U_perp_or_V.detach().contiguous())
+        k = self.lora_rank
+        if side == "left":
+            r, dp = Z_col.shape[0], U_perp_or_V.shape[1]
+            self.lora_A = nn.Parameter(torch.zeros(r, k))
+            self.lora_B = nn.Parameter(torch.zeros(dp, k))
+        else:
+            r, dp = Z_col.shape[0], U_perp_or_V.shape[0]
+            self.lora_A = nn.Parameter(torch.zeros(r, k))
+            self.lora_B = nn.Parameter(torch.zeros(dp, k))
+
+    def merged_weight(self) -> torch.Tensor:
+        Zp = (self.lora_A @ self.lora_B.T) * self.scaling  # r x (d_ff-H), zero at init
+        if self.side == "left":
+            return self.basis_col @ self.z_col.T + self.basis_perp @ Zp.T
+        return self.z_col @ self.basis_col + Zp @ self.basis_perp
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return nn.functional.linear(x, self.merged_weight())
@@ -282,8 +327,10 @@ class _TwydWrapper(nn.Module):
             pass
         return self.student(*args, **kwargs)
 
-    def get_teacher_outputs(self, **inputs):
+    def get_teacher_outputs(self, output_hidden_states: bool = False, **inputs):
         t = self.teacher
+        if output_hidden_states:
+            inputs = {**inputs, "output_hidden_states": True}
         # Teacher may live on CPU (see _resolve_teacher); run it on the
         # student's device WITHOUT mutating/copying the stored module.
         # torch.func.functional_call runs the same graph with mapped params.
@@ -379,6 +426,42 @@ def _load_pt_merged_(student: nn.Module, pt_ckpt: str) -> int:
     return n
 
 
+def _load_ridge_weights_(student: nn.Module, teacher: nn.Module, path: str) -> int:
+    """Load a calib_ridge .pt ``{"weights": {module_name: W}}`` into a plain student.
+
+    Intended to run BEFORE _build_factorized_student, so MLP modules are still
+    nn.Linear and can receive the deployed width-r weights directly.
+    """
+    obj = torch.load(path, map_location="cpu", weights_only=True)
+    weights = obj.get("weights", obj) if isinstance(obj, dict) else obj
+    if not isinstance(weights, dict):
+        raise ValueError(f"{path}: expected a dict of module_name -> weight")
+    n = 0
+    tmods = dict(teacher.named_modules())
+    with torch.no_grad():
+        for name, W in weights.items():
+            if not isinstance(W, torch.Tensor):
+                continue
+            if str(name).endswith(".weight"):
+                name = str(name)[:-len(".weight")]
+            try:
+                parent, attr = _get_parent(student, name)
+                mod = getattr(parent, attr)
+            except Exception:
+                continue
+            if hasattr(mod, "weight") and torch.is_tensor(getattr(mod, "weight", None)):
+                if tuple(mod.weight.shape) == tuple(W.shape):
+                    mod.weight.copy_(W.to(device=mod.weight.device, dtype=mod.weight.dtype))
+                    n += 1
+            elif callable(getattr(mod, "merged_weight", None)) and name in tmods:
+                from .init import set_deployed_weight
+                side = "right" if W.shape[0] < W.shape[1] else "left"
+                set_deployed_weight(mod, W, tmods[name].weight, side=side,
+                                    perp="residual", lora_rank=int(getattr(mod, "lora_rank", 0) or 0))
+                n += 1
+    return n
+
+
 def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                               branch: str) -> Dict[str, dict]:
     """Build TWYD student MLP.
@@ -389,8 +472,26 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
     """
     with_perp = (branch == "core")
     is_dense = (branch == "dense")
+    preserve_w = str(getattr(cfg, "warm_start", "")) in (
+        "ridge", "ridge_ckpt", "pt_ckpt", "base")
+    ridge_perp = str(getattr(cfg, "ridge_perp", "zero") or "zero")
+    preserve_perp = (str(getattr(cfg, "warm_start", "")) in (
+        "ridge_ckpt", "pt_ckpt", "base") and ridge_perp != "zero")
     lora_rank = int(getattr(cfg, "lora_rank", 0) or 0)
     lora_alpha = float(getattr(cfg, "lora_alpha", 16.0) or 16.0)
+    lora_mode = str(getattr(cfg, "lora_mode", "dense") or "dense")
+    lora_layers_spec = str(getattr(cfg, "lora_layers", "") or "")
+    try:
+        from .config import parse_layer_range as _parse_lr
+        n_lay = int(getattr(getattr(student, "config", None), "num_hidden_layers", 0) or 0)
+        lora_layer_set = _parse_lr(lora_layers_spec, n_lay) if lora_layers_spec.strip() else set()
+        lora_layer_active = bool(lora_layers_spec.strip())
+    except Exception:
+        lora_layer_set, lora_layer_active = set(), False
+    try:
+        from .config import layer_idx_of as _layer_idx
+    except Exception:
+        _layer_idx = lambda _n: None
     tcfg = getattr(teacher, "config", None)
     teacher_hidden = int(getattr(tcfg, "hidden_size", getattr(getattr(tcfg, "text_config", None), "hidden_size", 0)) or 0)
     if teacher_hidden == 0:
@@ -412,16 +513,32 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
             if not is_down:
                 d_ff, H = t_weight.shape
                 side = "left"
-                T, P = build_core_basis(t_weight, "left")
                 s_w = lin.weight.detach().to(torch.float32).cpu()
                 if s_w.shape != (d_ff, r):
                     tmp = torch.zeros(d_ff, r)
                     tmp[:, :min(r, s_w.shape[1])] = s_w[:d_ff, :min(r, s_w.shape[1])]
                     s_w = tmp
-                Z_col = (T.T @ s_w).T.contiguous()
-                W0 = (T @ Z_col.T).contiguous()  # merged plain weight d_ff x r
+                try:
+                    _li = _layer_idx(mod_name)
+                except Exception:
+                    _li = None
+                in_lora_set = (not lora_layer_active) or (_li is None) or (_li in lora_layer_set)
+                use_lora_here = (lora_rank > 0) and in_lora_set
                 if is_dense:
-                    if lora_rank > 0:
+                    # Dense-LRC deploys W directly. When the student base is the
+                    # teacher slice (the normal path) the slice *is* the merged
+                    # plain-LRC warm start, so no SVD is needed. For an arbitrary
+                    # base (tests/convert) project onto col(T) to keep the
+                    # Dense == CORE == plain init invariant.
+                    t_slice = t_weight[:, :r].to(torch.float32)
+                    if preserve_w or (s_w.shape == t_slice.shape and torch.allclose(s_w, t_slice, atol=1e-6)):
+                        W0 = s_w
+                        T = P = Z_col = None
+                    else:
+                        T, P = build_core_basis(t_weight, "left")
+                        Z_col = (T.T @ s_w).T.contiguous()
+                        W0 = (T @ Z_col.T).contiguous()
+                    if use_lora_here:
                         new_mod = DenseLinearLoRA(r, d_ff, lora_rank=lora_rank,
                                                    lora_alpha=lora_alpha,
                                                    base_weight=W0)
@@ -430,22 +547,57 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                         with torch.no_grad():
                             new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
-                    Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
-                    new_mod = CoreLinear(T, Z_col, P if with_perp else None,
-                                         Z_perp, side="left", with_perp=with_perp)
+                    T, P = build_core_basis(t_weight, "left")
+                    Z_col = (T.T @ s_w).T.contiguous()
+                    W0 = (T @ Z_col.T).contiguous()  # merged plain weight d_ff x r
+                    Z_perp_init = None
+                    if with_perp and preserve_perp:
+                        Z_perp_init = (P.T @ (s_w - T @ Z_col.T)).T.contiguous()
+                    use_core_lora = bool(use_lora_here and lora_mode == "core" and with_perp)
+                    if not in_lora_set:
+                        # Direction 1 (Fig.8b): deep layers frozen plain, zero trainable.
+                        new_mod = CoreLinear(T, Z_col, None, None, side="left", with_perp=False)
+                    elif use_core_lora:
+                        new_mod = CoreLinearLoRA(T, Z_col, P, lora_rank=lora_rank,
+                                                 lora_alpha=lora_alpha, side="left",
+                                                 freeze_col=bool(getattr(cfg, "freeze_col", False)))
+                        if Z_perp_init is not None:
+                            from .init import set_deployed_weight
+                            set_deployed_weight(new_mod, s_w, t_weight, side="left",
+                                                perp=ridge_perp, lora_rank=lora_rank)
+                    elif use_lora_here and lora_mode == "dense":
+                        new_mod = DenseLinearLoRA(r, d_ff, lora_rank=lora_rank,
+                                                   lora_alpha=lora_alpha,
+                                                   base_weight=(s_w if Z_perp_init is not None else W0))
+                    else:
+                        Z_perp = (Z_perp_init if Z_perp_init is not None
+                                  else (torch.zeros(r, d_ff - H) if with_perp else None))
+                        new_mod = CoreLinear(T, Z_col, P if with_perp else None,
+                                             Z_perp, side="left", with_perp=with_perp)
             else:
                 H, d_ff = t_weight.shape
                 side = "right"
-                R, Vp = build_core_basis(t_weight, "right")
                 s_w = lin.weight.detach().to(torch.float32).cpu()
                 if s_w.shape != (r, d_ff):
                     tmp = torch.zeros(r, d_ff)
                     tmp[:min(r, s_w.shape[0]), :] = s_w[:min(r, s_w.shape[0]), :d_ff]
                     s_w = tmp
-                Z_col = (s_w @ R.T).contiguous()
-                W0 = (Z_col @ R).contiguous()  # merged plain weight r x d_ff
+                try:
+                    _li = _layer_idx(mod_name)
+                except Exception:
+                    _li = None
+                in_lora_set = (not lora_layer_active) or (_li is None) or (_li in lora_layer_set)
+                use_lora_here = (lora_rank > 0) and in_lora_set
                 if is_dense:
-                    if lora_rank > 0:
+                    t_slice = t_weight[:r, :].to(torch.float32)
+                    if preserve_w or (s_w.shape == t_slice.shape and torch.allclose(s_w, t_slice, atol=1e-6)):
+                        W0 = s_w
+                        R = Vp = Z_col = None
+                    else:
+                        R, Vp = build_core_basis(t_weight, "right")
+                        Z_col = (s_w @ R.T).contiguous()
+                        W0 = (Z_col @ R).contiguous()
+                    if use_lora_here:
                         new_mod = DenseLinearLoRA(d_ff, r, lora_rank=lora_rank,
                                                    lora_alpha=lora_alpha,
                                                    base_weight=W0)
@@ -454,9 +606,33 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                         with torch.no_grad():
                             new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
-                    Z_perp = torch.zeros(r, d_ff - H) if with_perp else None
-                    new_mod = CoreLinear(R, Z_col, Vp if with_perp else None,
-                                         Z_perp, side="right", with_perp=with_perp)
+                    R, Vp = build_core_basis(t_weight, "right")
+                    Z_col = (s_w @ R.T).contiguous()
+                    W0 = (Z_col @ R).contiguous()  # merged plain weight r x d_ff
+                    Z_perp_init = None
+                    if with_perp and preserve_perp:
+                        Z_perp_init = ((s_w - Z_col @ R) @ Vp.T).contiguous()
+                    use_core_lora = bool(use_lora_here and lora_mode == "core" and with_perp)
+                    if not in_lora_set:
+                        # Direction 1 (Fig.8b): deep layers frozen plain, zero trainable.
+                        new_mod = CoreLinear(R, Z_col, None, None, side="right", with_perp=False)
+                    elif use_core_lora:
+                        new_mod = CoreLinearLoRA(R, Z_col, Vp, lora_rank=lora_rank,
+                                                 lora_alpha=lora_alpha, side="right",
+                                                 freeze_col=bool(getattr(cfg, "freeze_col", False)))
+                        if Z_perp_init is not None:
+                            from .init import set_deployed_weight
+                            set_deployed_weight(new_mod, s_w, t_weight, side="right",
+                                                perp=ridge_perp, lora_rank=lora_rank)
+                    elif use_lora_here and lora_mode == "dense":
+                        new_mod = DenseLinearLoRA(d_ff, r, lora_rank=lora_rank,
+                                                   lora_alpha=lora_alpha,
+                                                   base_weight=(s_w if Z_perp_init is not None else W0))
+                    else:
+                        Z_perp = (Z_perp_init if Z_perp_init is not None
+                                  else (torch.zeros(r, d_ff - H) if with_perp else None))
+                        new_mod = CoreLinear(R, Z_col, Vp if with_perp else None,
+                                             Z_perp, side="right", with_perp=with_perp)
         # basis algebra ran on CPU fp32; move the rebuilt module back onto
         # the device/dtype of the linear it replaces.
         setattr(parent, attr, new_mod.to(device=lin_dev, dtype=lin_dt))
@@ -468,17 +644,44 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
 
 
 def _freeze_for_branch(wrapper, cfg) -> None:
-    if cfg.branch == "dense":
-        # Train-what-you-deploy: only MLP linears we replaced stay trainable;
-        # keep attention/norm/embed frozen (paper App.B, minimal change).
-        wrapper.student.requires_grad_(False)
-        for n, p in wrapper.student.named_parameters():
-            if any(k in n for k in list(cfg.target_modules or [])):
-                p.requires_grad_(True)
-    else:
-        wrapper.student.requires_grad_(False)
-        for n, p in wrapper.student.named_parameters():
-            if "z_col" in n or "z_perp" in n:
+    lora_rank = int(getattr(cfg, "lora_rank", 0) or 0)
+    lora_layers_spec = str(getattr(cfg, "lora_layers", "") or "")
+    # Direction 1 (Fig.8b): when lora_layers is set, ONLY those layers train;
+    # everything else stays frozen plain (zero grad, zero optimizer state).
+    try:
+        from .config import parse_layer_range as _parse_lr, layer_idx_of as _layer_idx
+        n_lay = int(getattr(getattr(wrapper.student, "config", None), "num_hidden_layers", 0) or 0)
+        lora_layer_set = _parse_lr(lora_layers_spec, n_lay) if lora_layers_spec.strip() else set()
+        layer_active = bool(lora_layers_spec.strip())
+    except Exception:
+        lora_layer_set, layer_active = set(), False
+    wrapper.student.requires_grad_(False)
+    for n, p in wrapper.student.named_parameters():
+        lname = n.lower()
+        try:
+            _li = _layer_idx(n)
+        except Exception:
+            _li = None
+        if layer_active and _li is not None and _li not in lora_layer_set:
+            continue  # deep frozen-plain layers: keep requires_grad False
+        if cfg.branch == "dense":
+            # full dense-lrc: 整块 deployed 权重可训；
+            # LoRA-Dense: 只训 lora_A/lora_B，base_weight 保持冻结。
+            if lora_rank > 0:
+                if "lora_a" in lname or "lora_b" in lname:
+                    p.requires_grad_(True)
+            else:
+                if any(k in n for k in list(cfg.target_modules or [])):
+                    if "base_weight" not in lname:
+                        p.requires_grad_(True)
+        else:
+            # core/plain: z_col / z_perp / lora_A / lora_B 可训。
+            # CORE-LR (freeze_col=True) keeps the plain-LRC col path frozen and
+            # trains only the complement (Z_perp / its A B^T factors).
+            _freeze_col = bool(getattr(cfg, "freeze_col", False)) and cfg.branch == "core"
+            if "z_col" in n:
+                p.requires_grad_(not _freeze_col)
+            elif "z_perp" in n or "lora_a" in lname or "lora_b" in lname:
                 p.requires_grad_(True)
     for p in wrapper.teacher.parameters():
         p.requires_grad_(False)
@@ -556,38 +759,83 @@ def _hidden_of(mod: nn.Module) -> int:
         return 0
 
 
+def _student_head_layout(tc, r: int):
+    """Return (heads, kv, head_dim, new_heads, new_kv, kv_map) for width r.
+
+    LRC keeps the teacher's GQA grouping. A naive "largest divisor of new_heads"
+    choice changes the q/kv ratio (e.g. 24q/8kv -> 8q/8kv or 12q/6kv) and makes
+    every q head read the wrong kv head. Two cases:
+
+    * new_heads * kv is divisible by heads: ratio preserved exactly; student kv
+      head i is teacher kv head i (r=1536: 12q/4kv -> kv_map [0,1,2,3]).
+    * not divisible (r=1024: 8q cannot split into groups of 3): keep
+      new_kv = new_heads (ratio 1) and duplicate/select the teacher kv head each
+      q head actually used: kv_map[i] = floor(i * kv / heads)
+      (r=1024 -> [0,0,0,1,1,1,2,2]).
+    """
+    H = int(getattr(tc, "hidden_size", 0) or 0)
+    heads = int(getattr(tc, "num_attention_heads", 0) or 0)
+    kv = int(getattr(tc, "num_key_value_heads", None) or heads)
+    head_dim = int(getattr(tc, "head_dim", None) or ((H // heads) if heads else 0))
+    if H <= 0 or heads <= 0 or head_dim <= 0:
+        raise ValueError(f"[twyd] bad teacher attention config: H={H}, heads={heads}, head_dim={head_dim}")
+    if r % head_dim != 0:
+        raise ValueError(
+            f"[twyd] student_hidden r={r} not divisible by teacher head_dim={head_dim}; "
+            "pick TWYD_R that is a multiple of the teacher head_dim")
+    new_heads = r // head_dim
+    if new_heads <= 0 or new_heads > heads:
+        raise ValueError(
+            f"[twyd] r={r} gives new_heads={new_heads}, outside (0, teacher heads={heads}]")
+    if (new_heads * kv) % heads == 0:
+        new_kv = new_heads * kv // heads
+        kv_map = list(range(new_kv))
+    else:
+        new_kv = new_heads
+        kv_map = [min(kv - 1, (i * kv) // heads) for i in range(new_kv)]
+    assert new_heads % new_kv == 0, (new_heads, new_kv)
+    return heads, kv, head_dim, new_heads, new_kv, kv_map
+
+
+def _vocab_of(mod: nn.Module) -> int:
+    cfg = getattr(mod, "config", None)
+    tc = getattr(cfg, "text_config", None) or cfg
+    try:
+        return int(getattr(tc, "vocab_size", 0) or 0)
+    except Exception:
+        return 0
+
+
 def _shrink_student_(student: nn.Module, teacher: nn.Module, r: int) -> nn.Module:
     """Replace a full-width student with a width-r LRC student (slice init).
 
-    TWYD trains the deployed width-reduced model: hidden r, d_ff inherited from
-    the teacher, heads = r / head_dim (LowRankClone target_hidden_size style;
-    scripts/train_dense_standalone.py:build_student_from_teacher is the
-    reference). Warm start = slice the teacher weights (warm_start='slice').
-    Swift-set attrs (model_meta/model_dir/...) are carried onto the new model
-    so the stock swift pt/sft loop keeps working.
+    IMPORTANT: the width-r model must inherit the *teacher's* architecture
+    (head_dim, d_ff, vocab), not the --model student's. Building it from a 1B
+    student while the teacher is a 3B (head_dim 64 vs 128) scrambles q/k/v rows
+    and is a known cause of random accuracy.
+
+    Warm start here is still a plain slice of the teacher weights. This is only
+    a bootstrapping approximation: LRC's real warm start is the data-aware
+    greedy ridge/SVD init (paper Alg.1 / App. A.4), which is not implemented in
+    this path (see scripts/check_init.py for the step-0 gate).
     """
-    old_cfg = getattr(student, "config", None)
-    tc = getattr(old_cfg, "text_config", None) or old_cfg
-    H = _hidden_of(student)
-    heads = int(getattr(tc, "num_attention_heads", 8) or 8)
-    kv = int(getattr(tc, "num_key_value_heads", None) or heads)
-    head_dim = int(getattr(tc, "head_dim", None) or ((H // heads) if heads else 64))
-    if head_dim <= 0 or r % head_dim != 0:
+    tcfg = getattr(getattr(teacher, "config", None), "text_config", None) or getattr(teacher, "config", None)
+    sv, tv = _vocab_of(student), _vocab_of(teacher)
+    if sv and tv and sv != tv:
         raise ValueError(
-            f"[twyd] student_hidden r={r} not divisible by head_dim={head_dim}; "
-            "pick TWYD_R that is a multiple of the teacher head_dim")
-    new_heads = r // head_dim
-    # KV heads must divide query heads for GQA (SDPA requirement). Pick the
-    # largest divisor of new_heads that does not exceed the teacher's kv heads.
-    _kv_cap = min(kv, new_heads)
-    new_kv = next((d for d in range(_kv_cap, 0, -1) if new_heads % d == 0), 1)
-    cfg = deepcopy(old_cfg)
+            f"[twyd] teacher vocab {tv} != student vocab {sv}; "
+            "cannot slice/transfer embeddings across tokenizers")
+    H = _hidden_of(teacher)
+    heads, kv, head_dim, new_heads, new_kv, kv_map = _student_head_layout(tcfg, r)
+    cfg = deepcopy(getattr(teacher, "config"))
     target = getattr(cfg, "text_config", None)
     target = target if target is not None else cfg
     target.hidden_size = r
     target.num_attention_heads = new_heads
     if getattr(target, "num_key_value_heads", None):
         target.num_key_value_heads = new_kv
+    if getattr(target, "head_dim", None):
+        target.head_dim = head_dim
     from transformers import AutoModelForCausalLM
     try:
         new = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.bfloat16)
@@ -598,6 +846,15 @@ def _shrink_student_(student: nn.Module, teacher: nn.Module, r: int) -> nn.Modul
         for n, p in new.named_parameters():
             t = tsd.get(n)
             if t is None:
+                continue
+            # GQA: k/v rows are grouped by head; the width-r student may need a
+            # different kv head count and/or duplicated teacher kv heads.
+            if (n.endswith("k_proj.weight") or n.endswith("v_proj.weight")) \
+                    and t.dim() == 2 and t.shape[0] == kv * head_dim \
+                    and p.shape[0] == new_kv * head_dim:
+                rows = torch.cat([t[j * head_dim:(j + 1) * head_dim] for j in kv_map], dim=0)
+                if rows.shape[1] >= p.shape[1]:
+                    p.copy_(rows[:, :p.shape[1]].to(p.dtype))
                 continue
             if t.dim() != p.dim() or any(ps > tsz for ps, tsz in zip(p.shape, t.shape)):
                 continue
@@ -622,8 +879,8 @@ def _shrink_student_(student: nn.Module, teacher: nn.Module, r: int) -> nn.Modul
         new = new.to(device=ref.device, dtype=ref.dtype)
     except StopIteration:
         pass
-    print(f"[twyd] width shrink: student hidden {H} -> {r} "
-          f"(heads {heads}->{new_heads}, kv {kv}->{new_kv}, d_ff inherited)")
+    print(f"[twyd] width shrink: teacher hidden {H} -> {r} "
+          f"(heads {heads}->{new_heads}, kv {kv}->{new_kv}, kv_map={kv_map}, d_ff inherited)")
     return new
 
 
@@ -654,8 +911,20 @@ def _twyd_kw(args) -> dict:
         "target_modules": _os.environ.get("TWYD_TARGET_MODULES", None),
         "outlier_keep": _os.environ.get("TWYD_OUTLIER_KEEP", None),
         "ridge_lambda": _os.environ.get("TWYD_RIDGE_LAMBDA", None),
+        "ridge_perp": _os.environ.get("TWYD_RIDGE_PERP", None),
+        "master_p": _os.environ.get("TWYD_MASTER_P", None),
+        "calib_ids": _os.environ.get("TWYD_CALIB_IDS", None),
+        "calib_num_seqs": _os.environ.get("TWYD_CALIB_SEQS", None),
+        "calib_seq_len": _os.environ.get("TWYD_CALIB_SEQ_LEN", None),
+        "calib_batch_size": _os.environ.get("TWYD_CALIB_BATCH", None),
+        "calib_joint": _os.environ.get("TWYD_CALIB_JOINT", None),
+        "ridge_ckpt": _os.environ.get("TWYD_RIDGE_CKPT", None),
         "lora_rank": _os.environ.get("TWYD_LORA_RANK", None),
         "lora_alpha": _os.environ.get("TWYD_LORA_ALPHA", None),
+        "lora_mode": _os.environ.get("TWYD_LORA_MODE", None),
+        "lora_layers": _os.environ.get("TWYD_LORA_LAYERS", None),
+        "lora_lr": _os.environ.get("TWYD_LORA_LR", None),
+        "freeze_col": _os.environ.get("TWYD_FREEZE_COL", None),
     }
     for k, v in env_map.items():
         if v is None or (isinstance(v, str) and v == ""):
@@ -668,13 +937,14 @@ def _twyd_kw(args) -> dict:
         except Exception:
             return x
 
-    for k in ("student_hidden", "outlier_keep", "lora_rank"):
+    for k in ("student_hidden", "outlier_keep", "lora_rank",
+              "calib_num_seqs", "calib_seq_len", "calib_batch_size"):
         if k in kw and isinstance(kw[k], str):
             try:
                 kw[k] = int(kw[k])
             except Exception:
                 pass
-    for k in ("lora_alpha",):
+    for k in ("lora_alpha", "lora_lr",):
         if k in kw and isinstance(kw[k], str):
             try:
                 kw[k] = float(kw[k])
@@ -685,8 +955,23 @@ def _twyd_kw(args) -> dict:
             kw[k] = _num(kw[k])
     if "use_aux" in kw and isinstance(kw["use_aux"], str):
         kw["use_aux"] = kw["use_aux"].strip().lower() not in ("0", "false", "no", "off")
+    if "calib_joint" in kw and isinstance(kw["calib_joint"], str):
+        kw["calib_joint"] = kw["calib_joint"].strip().lower() not in ("0", "false", "no", "off")
+    if "freeze_col" in kw and isinstance(kw["freeze_col"], str):
+        kw["freeze_col"] = kw["freeze_col"].strip().lower() not in ("0", "false", "no", "off")
     if "target_modules" in kw and isinstance(kw["target_modules"], str):
-        kw["target_modules"] = [s.strip() for s in kw["target_modules"].split(",") if s.strip()]
+        _tm_raw = kw["target_modules"].strip()
+        # Accept both comma-separated (gate_proj,up_proj) and JSON-like
+        # (["gate_proj","up_proj"]) forms: strip brackets/quotes/whitespace.
+        _tm_raw = _tm_raw.strip()
+        if _tm_raw.startswith("[") and _tm_raw.endswith("]"):
+            _tm_raw = _tm_raw[1:-1]
+        _parts = []
+        for s in _tm_raw.split(","):
+            s = s.strip().strip("'\"[] \t")
+            if s:
+                _parts.append(s)
+        kw["target_modules"] = _parts
     mx = _os.environ.get("TWYD_MAX_AUX_LAYERS", None)
     if mx is not None and mx != "":
         try:
@@ -712,9 +997,20 @@ def _prepare_model_impl(args, model, branch: str):
               use_aux=kw.get("use_aux", True),
               aux_loss_type=kw.get("aux_loss_type", "mseloss"),
               ridge_lambda=kw.get("ridge_lambda"),
+              ridge_perp=str(kw.get("ridge_perp", "residual") or "residual").lower(),
+              master_p=str(kw.get("master_p", "none") or "none").lower(),
+              calib_ids=kw.get("calib_ids"),
+              calib_num_seqs=int(kw.get("calib_num_seqs", 128) or 128),
+              calib_seq_len=int(kw.get("calib_seq_len", 512) or 512),
+              calib_batch_size=int(kw.get("calib_batch_size", 2) or 2),
+              calib_joint=bool(kw.get("calib_joint", True)),
               outlier_keep=kw.get("outlier_keep", 0),
               lora_rank=kw.get("lora_rank", 0),
-              lora_alpha=kw.get("lora_alpha", 16.0))
+              lora_alpha=kw.get("lora_alpha", 16.0),
+              lora_mode=str(kw.get("lora_mode", "dense")).lower(),
+              lora_layers=str(kw.get("lora_layers", "") or ""),
+              lora_lr=kw.get("lora_lr", None),
+              freeze_col=bool(kw.get("freeze_col", False)))
     cfg.validate()
     teacher_id = cfg.teacher_model or getattr(args, "model", None)
     if teacher_id is None:
@@ -731,6 +1027,16 @@ def _prepare_model_impl(args, model, branch: str):
     r = int(cfg.student_hidden)
     if _hidden_of(student) != r:
         student = _shrink_student_(student, teacher, r)
+    master_P = None
+    if cfg.master_p == "embed_svd" and cfg.warm_start not in ("pt_ckpt", "ridge_ckpt"):
+        try:
+            from .init import build_master_P, project_student_with_P_
+            master_P = build_master_P(teacher, r)
+            n_p = project_student_with_P_(student, teacher, master_P)
+            print(f"[twyd] master P {tuple(master_P.shape)}: projected {n_p} tensors")
+        except Exception as e:
+            print(f"[twyd] master P projection failed ({e}); keeping slice init")
+            master_P = None
     # SFT warm start: load merged PT ckpt into the (possibly shrunk) student
     # BEFORE factorized rebuild, so Z_col/W0 inherit PT-learned weights
     # instead of the raw slice init. Teacher for SFT stays the open teacher.
@@ -741,9 +1047,51 @@ def _prepare_model_impl(args, model, branch: str):
             print(f"[twyd] SFT warm start: loaded {n} tensors from PT ckpt {pt_ckpt}")
         except Exception as e:
             print(f"[twyd] SFT warm start failed ({e}); falling back to slice init")
+    # Offline ridge checkpoint: a merged HF dir or a .pt {"weights": {...}}.
+    # Load BEFORE factorization so Z_col/Z_perp are rebuilt from the ridge W.
+    ridge_ckpt = kw.get("ridge_ckpt", None)
+    if cfg.warm_start == "ridge_ckpt" and ridge_ckpt:
+        try:
+            if os.path.isdir(str(ridge_ckpt)):
+                n = _load_pt_merged_(student, ridge_ckpt)
+            else:
+                n = _load_ridge_weights_(student, teacher, str(ridge_ckpt))
+            print(f"[twyd] ridge ckpt: loaded {n} MLP weights from {ridge_ckpt}")
+        except Exception as e:
+            print(f"[twyd] ridge ckpt load failed ({e}); falling back to slice init")
     meta = _build_factorized_student(student, teacher, cfg, branch=branch)
     wrapper = _TwydWrapper(student, teacher, cfg)
     wrapper.twyd_meta = meta
+    wrapper.twyd_master_P = master_P
+    # In-training greedy ridge calibration (paper Alg.1).  Requires a small
+    # calibration token file; without one we keep the slice/PT/ridge-ckpt init.
+    if cfg.warm_start == "ridge":
+        ids_path = cfg.calib_ids or kw.get("calib_ids")
+        if not ids_path:
+            print("[twyd] warm_start=ridge but no calib_ids/TWYD_CALIB_IDS; "
+                  "keeping the current init")
+        else:
+            try:
+                from .init import calibrate_ridge, load_calib_ids
+                tok = None
+                if os.path.splitext(str(ids_path))[1].lower() in (".jsonl", ".json", ".txt"):
+                    from transformers import AutoTokenizer
+                    tok = AutoTokenizer.from_pretrained(teacher_id, trust_remote_code=True)
+                ids = load_calib_ids(str(ids_path), tokenizer=tok,
+                                     seq_len=cfg.calib_seq_len,
+                                     num_seqs=cfg.calib_num_seqs)
+                rep = calibrate_ridge(student, teacher, ids,
+                                      target_modules=cfg.target_modules,
+                                      ridge_lambda=cfg.ridge_lambda,
+                                      perp=cfg.ridge_perp,
+                                      joint=cfg.calib_joint,
+                                      batch_size=cfg.calib_batch_size)
+                print(f"[twyd] ridge init: groups={rep['n_groups']} tokens={rep['n_tokens']} "
+                      f"rel {rep['mean_rel_before']:.4f} -> "
+                      f"{rep.get('mean_rel_deployed', rep['mean_rel_after']):.4f}")
+                wrapper.twyd_ridge = rep
+            except Exception as e:
+                print(f"[twyd] ridge calibration failed ({e}); keeping the current init")
     _freeze_for_branch(wrapper, cfg)
     return wrapper
 

@@ -1,7 +1,10 @@
 """TWYD LRC distillation package (ms-swift plugins)."""
 from .config import TwydLRCConfig
 from .core_basis import build_core_basis, check_basis
-from .init import build_outlier_aware_P, ridge_zcol, zero_perp_
+from .init import (build_master_P, build_outlier_aware_P, calibrate_attention,
+                   calibrate_ridge, factorize_deployed, head_projection_mats,
+                   load_calib_ids, project_student_with_P_,
+                   ridge_deployed, ridge_zcol, zero_perp_)
 from .loss import LrcDistillLoss
 from .merge import merge_and_save, merged_state_dict
 from .tuner import CoreLinear, CoreLRCAdapter, DenseLRCAdapter, PlainLRCAdapter
@@ -14,6 +17,14 @@ __all__ = [
     "build_core_basis",
     "check_basis",
     "build_outlier_aware_P",
+    "build_master_P",
+    "calibrate_attention",
+    "calibrate_ridge",
+    "factorize_deployed",
+    "head_projection_mats",
+    "load_calib_ids",
+    "project_student_with_P_",
+    "ridge_deployed",
     "ridge_zcol",
     "zero_perp_",
     "LrcDistillLoss",

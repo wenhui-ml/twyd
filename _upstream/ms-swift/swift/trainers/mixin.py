@@ -352,13 +352,21 @@ class SwiftMixin:
                     _unwrap_model.save_pretrained(output_dir, safe_serialization=safe_serialization, **save_kwargs)
             else:
                 logger.info('Trainer.model is not a `PreTrainedModel`, only saving its state dict.')
-                if use_flash_ckpt:
-                    self.flash_checkpointer.ckpt_agent.save(state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
+                # TWYD tuners (dense_lrc/core_lrc/plain_lrc) provide custom
+                # save_pretrained that merges trainable factors (LoRA A/B,
+                # CoreLinear z_col/z_perp) into deployed weights before saving.
+                if self.args.tuner_type in tuners_map:
+                    tuners_map[self.args.tuner_type].save_pretrained(
+                        self.model, output_dir, state_dict=state_dict,
+                        safe_serialization=safe_serialization)
                 else:
-                    if safe_serialization:
-                        safetensors.torch.save_file(state_dict, os.path.join(output_dir, 'model.safetensors'))
+                    if use_flash_ckpt:
+                        self.flash_checkpointer.ckpt_agent.save(state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
                     else:
-                        torch.save(state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
+                        if safe_serialization:
+                            safetensors.torch.save_file(state_dict, os.path.join(output_dir, 'model.safetensors'))
+                        else:
+                            torch.save(state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
         elif is_instance_of_ms_model(self.model):
             if use_flash_ckpt:
                 PreTrainedModel.save_pretrained(

@@ -97,7 +97,9 @@ class LrcDistillLoss(_BaseLoss):
             get_t = getattr(raw_model, "get_teacher_outputs", None)
         if get_t is not None and inputs:
             try:
-                t_out = get_t(**{k: v for k, v in inputs.items()
+                _want_hidden = bool(use_aux and lam > 0)
+                t_out = get_t(output_hidden_states=_want_hidden,
+                              **{k: v for k, v in inputs.items()
                                  if k in ("input_ids", "attention_mask", "position_ids")})
                 t_logits = (t_out.logits if hasattr(t_out, "logits") else t_out["logits"]).detach()
                 try:
@@ -150,10 +152,12 @@ class LrcDistillLoss(_BaseLoss):
                         except Exception:
                             has_real_forward = False
                         if inputs and has_real_forward:
-                            with torch.no_grad():
-                                _s = m.student(**{k: v for k, v in inputs.items()
-                                                  if k in ("input_ids", "attention_mask", "position_ids")},
-                                               output_hidden_states=True, use_cache=False)
+                            # Must stay in the autograd graph: the aux term is a
+                            # training loss. The old no_grad() here made L_align
+                            # a constant even when teacher hidden states existed.
+                            _s = m.student(**{k: v for k, v in inputs.items()
+                                              if k in ("input_ids", "attention_mask", "position_ids")},
+                                           output_hidden_states=True, use_cache=False)
                             s_hidden = getattr(_s, "hidden_states", None)
                     except Exception:
                         s_hidden = None
