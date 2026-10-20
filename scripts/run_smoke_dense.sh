@@ -14,11 +14,15 @@ export TWYD_AUX_WEIGHT=0.2
 export TWYD_USE_AUX=true
 export TWYD_TARGET_MODULES=gate_proj,up_proj,down_proj
 
-/home/chenwh/miniconda3/envs/twyd/bin/swift pt \
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
+
+"$SWIFT" pt \
   --model /home/chenwh/models/Llama-3.2-1B-Instruct \
   --dataset /home/chenwh/Papers/twyd/data/smoke_pt.jsonl \
   --tuner_type dense_lrc \
   --loss_type lrc_distill \
+  --attn_impl "$ATTN_IMPL" \
   --external_plugins twyd.plugin \
   --train_type full \
   --torch_dtype bfloat16 \

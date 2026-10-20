@@ -1,4 +1,4 @@
-# TWYD on ms-swift：技术复现、TWYD-LR 与 MoE 路线
+# TWYD on ms-swift：技术复现、CORE-LR、TWYD-MoE 与创业计划
 
 > 目标：在 ms-swift 上把 TWYD 从“论文 + 私有代码”做成可复现、可开源、可融资的技术资产。
 > 原则：先让 step-0 初始化过 gate，再谈参数效率；先在小模型上拿到可信的 Pareto 曲线，再上 MoE 和大预算。
@@ -10,6 +10,23 @@
 - 实际 run：`dense-lora128-r1024-ddp-2gpu-100k`，3B teacher、r=1024、LoRA rank=128、SFT-only 45M tokens。
 - 结果：step 1 `token_acc=1.9e-4`，1368 步后 13.2%；merged CE≈11.3、token acc=0；9 任务全部随机。
 - 根因：width-r 学生由 teacher 权重 top-left slice 构造，不是 LRC warm start；attention/embedding 冻结；aux 失效。
+
+## 0.1 最新结论（2026-10-21）
+
+- **Qwen Table 8 是 CORE 的核心证据，但不是 teacher parity**：
+  `Qwen2.5-3B→1.7B, r=2048, ρ=5.375, stranded=81.4%`；teacher 69.11，
+  full CORE 10B PT 63.44，PT+SFT 63.82，Dense 10B 59.38，LRC 20B 63.43。
+  CORE 的承诺是 **2× token efficiency + 相对 matched LRC +10.45**。
+- **Llama 是效率对照**：`3B→1.5B, r=1536, ρ=2.67, stranded=62.5%`；
+  论文里 Dense/CORE tie，CORE-LR 目标是“更少坐标打平”，不强求超过 Dense。
+- **1B 从零构造仍未过 gate**：slice/MLP/P/attention ridge 都 FAIL；
+  现阶段必须先拿官方 LRC base / PT checkpoint，否则 dense/core 对比无效。
+- **CORE-LR 低秩假设尚未证明**：下一步的关键 gate 是
+  `k<=256` 逼近 full CORE，且可训坐标 `<=25%`、step time/optimizer memory 下降。
+- **FlashAttention/AOTriton**：2048 context 用 `twyd` + SDPA + AOTriton 即可，
+  不需要依赖 `flash_attn` 包；详见 `README.md` 的环境/2048 节。
+- **技术方案**（模型对、四阶段实验、rank allocator、factorized forward、Go/No-Go）
+  已写入 `README.md` 的 “CORE-LR 技术方案（2026-10）”。
 
 ## 1. 技术判断：TWYD-LR 应该是 CORE-LR，不是 dense-LoRA
 
@@ -149,6 +166,8 @@
 - 壁垒：评测/数据管线 + MoE rank 分配 + 可复现的工程实现；不是单个公式；
 - 里程碑：M0 gate + pilot（1–2 月）→ M1 CORE-LR Pareto（2–3 月）→ M2 MoE pilot（4–6 月）→ 融资/客户 POC。
 
+> 详细的客户、产品形态、商业模式、90 天/12 个月里程碑、融资与护城河见 §7。
+
 ## 6. 本周就做的 5 件事
 
 1. 跑 `scripts/check_init.py`，把 r=1536 的 FAIL 记录成 issue；在 gate 通过前冻结所有训练。
@@ -156,3 +175,140 @@
 3. 固定 pilot：1B teacher→r=512/768，0.2B tokens，plain vs dense vs CORE vs CORE-LR(128/256/512)，2 seeds。
 4. 加 `scripts/param_budget.py` 到实验报告；每个 run 记录可训坐标、GPU 小时、merge parity、CE/acc。
 5. 写 2 页技术 memo（给融资/合作方）：问题、方法、Pareto 图、复现命令、IP 声明。
+
+## 7. 创业计划（CORE-LR 楔子，TWYD-MoE 扩张）
+
+> 技术是楔子，不是公司。公司卖的是“**同样的任务质量，更低的训练/部署成本**”，
+> 不是“一个 rank 公式”。
+
+### 7.1 一句话定位
+
+> **TWYD 让企业用更少的训练参数和显存，把 Qwen/Llama 压缩成可部署的小模型；
+> 训练只学关键补空间，推理零额外开销，并可扩展到 MoE。**
+
+### 7.2 客户与楔子
+
+优先级：
+
+1. **私有化/行业模型团队**：有 Qwen/Llama 教师、需要 1.5B–2B 级可部署学生；
+2. **中文企业知识库/客服/金融/医疗**：成本敏感、数据不能出域；
+3. **边缘/端侧**：参数量、显存、推理延迟有硬约束；
+4. **MoE 团队**：已有 MoE 教师，想把 expert MLP 的 stranded capacity 用起来。
+
+第一个 wedge 不要做“通用大模型压缩平台”，而是：
+
+```text
+一个行业 + 一个教师模型 + 一个 1.5B–2B 学生 + 一套 eval
+```
+
+### 7.3 产品形态
+
+- **开源核心**：ms-swift plugin、CORE-LR、merge/eval/复现脚本（Apache-2.0）。
+- **商业层**：
+  - rank allocator（per-layer / per-projection / per-expert）；
+  - factorized CORE kernel（真实训练成本下降）；
+  - MoE router-aware allocation；
+  - 领域数据/校准/评测管线；
+  - 企业适配与支持。
+
+### 7.4 必须拿出的 proof points
+
+1. **Qwen2.5 3B→1.7B r=2048**：
+   - full CORE 10B PT 63.44 / PT+SFT 63.82（论文参考）；
+   - CORE-LR(k<=256) 与 full CORE 差距 <=0.5；
+   - 可训坐标 <= full CORE 的 25%；
+   - step time 或 optimizer memory 明显下降。
+2. **Llama 3.2 3B→1.5B r=1536**：
+   - CORE-LR 用更少坐标打平 Dense/full CORE；
+   - 证明方法不是 Qwen 特例。
+3. **部署**：
+   - merge 后是普通 dense width-r 模型；
+   - 推理框架零改动；
+   - prefill/decode 延迟、显存、吞吐有实测。
+4. **MoE pilot**：
+   - per-expert rank 优于 uniform rank（同总预算）；
+   - merge 后路由/输出一致。
+
+### 7.5 商业模式
+
+- **License**：企业版插件 + rank allocator + MoE 模块；
+- **压缩服务**：按模型/项目交付，包含 eval 和部署验证；
+- **订阅/支持**：模型升级、数据/评测管线、私有化部署；
+- **联合研发**：与云厂商/模型厂商/行业 ISV 合作。
+
+不要按“训练 token 数”收费；按“交付的模型质量 + 成本节省 + 部署价值”收费。
+
+### 7.6 里程碑
+
+#### 0–90 天（Pre-seed 证据）
+
+- G0：官方 LRC base 过 gate；
+- G1：Qwen 代理 full CORE 复现 CORE > Dense；
+- G2：CORE-LR(k<=256) 逼近 full CORE；
+- G3：factorized forward 让 step time/optimizer memory 下降；
+- 2 个 design partners 的领域 eval；
+- 一页 Pareto 图 + 一页成本模型。
+
+#### 3–6 个月（Seed 证据）
+
+- Qwen/Llama 目标规模 0.2–0.5B token 放大；
+- 一个客户 POC：同质量、训练成本降低、部署零额外开销；
+- MoE pilot：per-expert rank 可行；
+- 开源 repo 有外部用户/issue/PR。
+
+#### 6–12 个月（A 轮叙事）
+
+- 2–3 个付费客户/LOI；
+- MoE 压缩 recipe；
+- 模型 zoo（Qwen/Llama/领域模型）；
+- 可复现的 tokens-to-target / $/quality 证据。
+
+### 7.7 融资阶段与资金用途
+
+- **Pre-seed**：技术 de-risk + 2 个 design partners；资金用于 GPU/云、1–2 名工程师、IP/法务。
+- **Seed**：CORE-LR 目标规模 + MoE pilot + 客户 POC；资金用于算力、BD、评测/数据。
+- **A 轮**：模型 zoo + 商业化；资金用于销售、算力、MoE 规模化。
+- 不要在 2×7900 XTX 上承诺 10B 全量；把“租赁算力/云 GPU”写进预算。
+
+### 7.8 护城河
+
+公式是公开的，CORE 本身不是护城河。护城河是：
+
+1. **rank allocator**：per-layer / per-projection / per-expert 的预算分配；
+2. **factorized CORE execution**：真实训练成本下降的工程实现；
+3. **MoE router-aware allocation**：expert 负载/梯度/子空间共享；
+4. **评测/数据/校准管线**：可复现的 Pareto 和客户 eval；
+5. **ms-swift/HF 集成**：一键训练、merge、部署；
+6. **模型 zoo / 领域 recipe**：Qwen/Llama/行业模型的可复用配方。
+
+### 7.9 风险与 Go/No-Go
+
+| 风险 | 触发条件 | 应对 |
+|---|---|---|
+| CORE-LR 低秩不成立 | k 必须 1024–2048 才接近 full CORE | 退回 full CORE/服务化，或改结构化低秩 |
+| Qwen teacher gap 被误读 | 把 63.8 当成应到 69.1 | 明确“vs full CORE/20B LRC”指标 |
+| attention/embedding 是瓶颈 | 逐层 cosine 在早期就崩 | attention zoom / LRC co-training / 容量 |
+| 2 卡算力不足 | 10B 全量不可行 | 代理模型 + 论文 checkpoint + 租卡 |
+| 前司 IP 风险 | 代码/权重/数据来源不清 | clean-room、license 审核、律师 opinion |
+| MoE 分散主线 | dense 未过 G2 就做 MoE | 冻结 MoE，直到 G2/G3 通过 |
+
+### 7.10 不做什么
+
+- 不做“又一个 LoRA”；
+- 不承诺 Qwen teacher parity；
+- 不把“参数少”直接等同于“推理快”；
+- 不在 dense CORE-LR 未证明前做大规模 MoE；
+- 不使用前司未公开的代码/权重/数据；
+- 不在 2 卡上硬跑 10B 全量。
+
+### 7.11 一页 pitch
+
+```text
+问题：企业要在固定推理成本下提升模型能力；full CORE/大模型训练浪费在不可达方向。
+方案：CORE-LR 只学关键补空间 + rank allocator + factorized execution；
+      部署仍是普通 dense 小模型，推理零额外开销；MoE 按 expert 分配 rank。
+证据：Qwen 3B→1.7B full CORE 10B 追平 20B LRC；CORE-LR k<=256 逼近 full CORE；
+      Llama 作为效率对照；merge parity + 实测训练/推理成本。
+壁垒：allocator + factorized kernel + MoE + eval/data + ms-swift 集成。
+阶段：Pre-seed 证据（90 天）→ Seed 客户 POC（6 个月）→ A 轮模型 zoo/MoE（12 个月）。
+```

@@ -21,6 +21,8 @@ R=${R:-1536}
 K=${K:-256}
 ALPHA=${ALPHA:-$((2 * K))}
 LR=${LR:-1e-4}
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+MAX_LENGTH=${MAX_LENGTH:-1024}
 MAX_STEPS=${MAX_STEPS:-2000}
 DATASET=${DATASET:-swift/ultrachat_200k#100000}
 SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
@@ -57,9 +59,10 @@ echo "=============================="
   --dataset "$DATASET" \
   --tuner_type core_lrc \
   --loss_type lrc_distill \
+  --attn_impl "$ATTN_IMPL" \
   --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
   --torch_dtype bfloat16 \
-  --max_length 1024 \
+  --max_length "$MAX_LENGTH" \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 16 \
   --learning_rate "$LR" \

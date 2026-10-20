@@ -15,6 +15,9 @@ export TWYD_LORA_ALPHA=16.0
 export TWYD_LORA_MODE=dense
 export TWYD_OPTIM=adafactor
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+MAX_LENGTH=${MAX_LENGTH:-1024}
+SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
 
 OUTPUT_DIR=/home/chenwh/Papers/twyd/output/dense-lora128-r1024-2gpu-100k
 
@@ -28,14 +31,15 @@ echo "模型: Llama-3.2-1B-Instruct (student) + Llama-3.2-3B-Instruct (teacher)"
 echo "输出: $OUTPUT_DIR"
 echo "=============================="
 
-/home/chenwh/miniconda3/envs/twyd/bin/swift sft \
+"$SWIFT" sft \
     --model /home/chenwh/models/Llama-3.2-1B-Instruct \
     --dataset swift/ultrachat_200k#100000 \
     --tuner_type dense_lrc \
     --loss_type lrc_distill \
+    --attn_impl "$ATTN_IMPL" \
     --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
     --torch_dtype bfloat16 \
-    --max_length 1024 \
+    --max_length "$MAX_LENGTH" \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --learning_rate 1e-4 \

@@ -30,7 +30,7 @@ DATASETS=(
   "AI-ModelScope/OpenOrca-Chinese#10000"
 )
 
-SWIFT=/home/chenwh/miniconda3/envs/twyd/bin/swift
+SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
 
 run_one() {
   local ds="$1"          # "id#count"
@@ -45,11 +45,14 @@ run_one() {
   echo "[START] dataset=$id  samples=$cnt  output=$out"
   echo "============================================================"
 
+  ATTN_IMPL=${ATTN_IMPL:-sdpa}
+
   "$SWIFT" sft \
     --model "/home/chenwh/models/Llama-3.2-1B-Instruct" \
     --dataset "$id#$cnt" \
     --tuner_type dense_lrc \
     --loss_type lrc_distill \
+    --attn_impl "$ATTN_IMPL" \
     --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
     --torch_dtype bfloat16 \
     --max_length 1024 \

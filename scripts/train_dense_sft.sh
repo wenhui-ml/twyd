@@ -9,11 +9,14 @@ PT_CKPT="${PT_CKPT:-./outputs/dense-pt}"
 TEACHER="${TEACHER:-Qwen/Qwen2.5-3B-Instruct}"
 SFT_DATA="${SFT_DATA:-AI-ModelScope/alpaca-gpt4-data-zh#5000}"
 R="${STUDENT_HIDDEN:-1200}"
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+
 swift sft \
   --model "${PT_CKPT}" \
   --dataset "${SFT_DATA}" \
   --tuner_type dense_lrc \
   --loss_type lrc_distill \
+  --attn_impl "$ATTN_IMPL" \
   --external_plugins twyd.plugin \
   --tuner_kwargs "{\"teacher_model\":\"${TEACHER}\",\"student_hidden\":${R},\"stage\":\"sft\",\"warm_start\":\"pt_ckpt\",\"pt_ckpt\":\"${PT_CKPT}\",\"kl_temperature\":40.0,\"aux_weight\":0.2}" \
   --train_type full \

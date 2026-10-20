@@ -26,14 +26,19 @@ echo "CORE-LoRA 2GPU SFT: 10万条 ultrachat_200k, 1 epoch"
 echo "branch=core + lora_mode=core rank=128 layers=0-8 lr=1e-4 cosine"
 echo "输出: $OUTPUT_DIR"
 echo "=============================="
-/home/chenwh/miniconda3/envs/twyd/bin/swift sft \
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+MAX_LENGTH=${MAX_LENGTH:-1024}
+SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
+
+"$SWIFT" sft \
     --model /home/chenwh/models/Llama-3.2-1B-Instruct \
     --dataset swift/ultrachat_200k#100000 \
     --tuner_type core_lrc \
     --loss_type lrc_distill \
+    --attn_impl "$ATTN_IMPL" \
     --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
     --torch_dtype bfloat16 \
-    --max_length 1024 \
+    --max_length "$MAX_LENGTH" \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --learning_rate 1e-4 \

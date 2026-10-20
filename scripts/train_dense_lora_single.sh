@@ -22,11 +22,15 @@ export TWYD_TARGET_MODULES="gate_proj,up_proj,down_proj"
 DATASET=${1:-"/home/chenwh/Papers/twyd/data/smoke_pt.jsonl"}
 OUTPUT_DIR=${2:-"./output/llama3-3b-dense-lora-pt"}
 
-/home/chenwh/miniconda3/envs/twyd/bin/swift pt \
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
+
+"$SWIFT" pt \
   --model /home/chenwh/models/Llama-3.2-3B-Instruct \
   --dataset "$DATASET" \
   --tuner_type dense_lrc \
   --loss_type lrc_distill \
+  --attn_impl "$ATTN_IMPL" \
   --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
   --optim adafactor \
   --torch_dtype bfloat16 \

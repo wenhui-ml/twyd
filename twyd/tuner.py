@@ -712,7 +712,17 @@ def _merge_state_dict_(model, state_dict) -> None:
         pass
 
 
-def _resolve_teacher(student: nn.Module, teacher_id: str) -> nn.Module:
+def _attn_impl_of(mod: nn.Module):
+    """Read the attention implementation from a model/config (incl. text_config)."""
+    cfg = getattr(mod, "config", None)
+    tc = getattr(cfg, "text_config", None) or cfg
+    if tc is None:
+        return None
+    return (getattr(tc, "_attn_implementation", None)
+            or getattr(tc, "attn_implementation", None))
+
+
+def _resolve_teacher(student: nn.Module, teacher_id: str, attn_impl=None) -> nn.Module:
     """Reuse weights when teacher == student to avoid double VRAM.
 
     - Same local dir / same HF id as the student model: deep-copy the already
@@ -740,11 +750,19 @@ def _resolve_teacher(student: nn.Module, teacher_id: str) -> nn.Module:
         return t.eval()
     try:
         from transformers import AutoModelForCausalLM
-        teacher = AutoModelForCausalLM.from_pretrained(
-            teacher_id, torch_dtype=torch.bfloat16,
-            trust_remote_code=True, device_map="cpu", low_cpu_mem_usage=True)
+        load_kwargs = dict(
+            torch_dtype=torch.bfloat16, trust_remote_code=True,
+            device_map="cpu", low_cpu_mem_usage=True)
+        if attn_impl:
+            load_kwargs["attn_implementation"] = attn_impl
+        teacher = AutoModelForCausalLM.from_pretrained(teacher_id, **load_kwargs)
     except Exception:
-        teacher = deepcopy(student)
+        try:
+            teacher = AutoModelForCausalLM.from_pretrained(
+                teacher_id, torch_dtype=torch.bfloat16,
+                trust_remote_code=True, device_map="cpu", low_cpu_mem_usage=True)
+        except Exception:
+            teacher = deepcopy(student)
     for p in teacher.parameters():
         p.requires_grad_(False)
     return teacher.eval()
@@ -806,7 +824,8 @@ def _vocab_of(mod: nn.Module) -> int:
         return 0
 
 
-def _shrink_student_(student: nn.Module, teacher: nn.Module, r: int) -> nn.Module:
+def _shrink_student_(student: nn.Module, teacher: nn.Module, r: int,
+                     attn_impl: Optional[str] = None) -> nn.Module:
     """Replace a full-width student with a width-r LRC student (slice init).
 
     IMPORTANT: the width-r model must inherit the *teacher's* architecture
@@ -830,6 +849,18 @@ def _shrink_student_(student: nn.Module, teacher: nn.Module, r: int) -> nn.Modul
     cfg = deepcopy(getattr(teacher, "config"))
     target = getattr(cfg, "text_config", None)
     target = target if target is not None else cfg
+    # Preserve the attention backend selected by ms-swift / --attn_impl.
+    # Without this, from_config() inherits the teacher's default (sdpa/eager)
+    # and silently drops flash_attention_2 in the width-shrink path.
+    attn_impl = attn_impl or _attn_impl_of(student)
+    if attn_impl:
+        for c in (cfg, target):
+            try:
+                setattr(c, "_attn_implementation", attn_impl)
+                if hasattr(c, "attn_implementation"):
+                    setattr(c, "attn_implementation", attn_impl)
+            except Exception:
+                pass
     target.hidden_size = r
     target.num_attention_heads = new_heads
     if getattr(target, "num_key_value_heads", None):
@@ -1016,7 +1047,8 @@ def _prepare_model_impl(args, model, branch: str):
     if teacher_id is None:
         raise ValueError("twyd needs tuner_kwargs.teacher_model")
     student = model
-    teacher = _resolve_teacher(student, teacher_id)
+    attn_impl = _attn_impl_of(student)
+    teacher = _resolve_teacher(student, teacher_id, attn_impl=attn_impl)
     teacher.eval()
     # Width shrink: TWYD trains the deployed width-r model. If the --model
     # student is still full-width, rebuild it at hidden=r (slice warm start
@@ -1026,7 +1058,7 @@ def _prepare_model_impl(args, model, branch: str):
         cfg.student_hidden = max(64, _hidden_of(teacher) // 2)
     r = int(cfg.student_hidden)
     if _hidden_of(student) != r:
-        student = _shrink_student_(student, teacher, r)
+        student = _shrink_student_(student, teacher, r, attn_impl=attn_impl)
     master_P = None
     if cfg.master_p == "embed_svd" and cfg.warm_start not in ("pt_ckpt", "ridge_ckpt"):
         try:

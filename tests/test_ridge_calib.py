@@ -142,6 +142,19 @@ def test_master_p_slice_matches_shrink():
                           s2.get_input_embeddings().weight, atol=1e-3)
 
 
+def test_shrink_preserves_attn_impl():
+    """Width-shrink must not silently drop --attn_impl (e.g. flash_attention_2)."""
+    from transformers import AutoModelForCausalLM, LlamaConfig
+    cfg = LlamaConfig(
+        vocab_size=128, hidden_size=32, intermediate_size=96,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=8, max_position_embeddings=64, tie_word_embeddings=True)
+    teacher = AutoModelForCausalLM.from_config(cfg).eval()
+    teacher.config._attn_implementation = "sdpa"
+    shrunk = _shrink_student_(teacher, teacher, 16)
+    assert shrunk.config._attn_implementation == "sdpa"
+
+
 def test_master_p_projection_tiny_hf(tmp_path):
     from transformers import AutoModelForCausalLM, LlamaConfig
     cfg = LlamaConfig(

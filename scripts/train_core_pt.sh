@@ -5,11 +5,14 @@ STUDENT="${STUDENT:-Qwen/Qwen2.5-3B-Instruct}"
 TEACHER="${TEACHER:-Qwen/Qwen2.5-3B-Instruct}"
 PT_DATA="${PT_DATA:-./data/pt_chunks.jsonl}"
 R="${STUDENT_HIDDEN:-1200}"
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+
 swift pt \
   --model "${STUDENT}" \
   --dataset "${PT_DATA}" \
   --tuner_type core_lrc \
   --loss_type lrc_distill \
+  --attn_impl "$ATTN_IMPL" \
   --external_plugins twyd.plugin \
   --tuner_kwargs "{\"teacher_model\":\"${TEACHER}\",\"student_hidden\":${R},\"stage\":\"pt\",\"kl_temperature\":40.0,\"aux_weight\":0.2}" \
   --train_type full \

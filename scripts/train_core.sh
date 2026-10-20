@@ -5,11 +5,14 @@ STUDENT="${STUDENT:-Qwen/Qwen2.5-3B-Instruct}"
 TEACHER="${TEACHER:-Qwen/Qwen2.5-3B-Instruct}"
 DATASET="${DATASET:-AI-ModelScope/alpaca-gpt4-data-zh#5000}"
 R="${STUDENT_HIDDEN:-1200}"
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+
 swift pt \
   --model "${STUDENT}" \
   --dataset "${DATASET}" \
   --tuner_type core_lrc \
   --loss_type lrc_distill \
+  --attn_impl "$ATTN_IMPL" \
   --external_plugins twyd.plugin \
   --tuner_kwargs "{\"teacher_model\":\"${TEACHER}\",\"student_hidden\":${R},\"kl_temperature\":40.0,\"aux_weight\":0.2}" \
   --train_type full \

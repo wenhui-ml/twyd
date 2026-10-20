@@ -32,7 +32,7 @@ DATASET_ARGS=(
   "AI-ModelScope/alpaca-gpt4-data-zh"
 )
 
-SWIFT=/home/chenwh/miniconda3/envs/twyd/bin/swift
+SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
 
 LOG="/tmp/dense_sft_merged_1epoch_small.log"
 OUT="$OUTPUT_DIR"
@@ -44,11 +44,14 @@ echo "输出目录: $OUT"
 echo "日志: $LOG"
 echo "============================================================"
 
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+
 "$SWIFT" sft \
   --model "/home/chenwh/models/Llama-3.2-1B-Instruct" \
   --dataset "${DATASET_ARGS[@]}" \
   --tuner_type dense_lrc \
   --loss_type lrc_distill \
+  --attn_impl "$ATTN_IMPL" \
   --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
   --torch_dtype bfloat16 \
   --max_length 1024 \

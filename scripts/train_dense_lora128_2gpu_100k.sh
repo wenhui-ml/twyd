@@ -29,14 +29,19 @@ echo "模型: Llama-3.2-1B student(r=512) + Llama-3.2-3B teacher"
 echo "输出: $OUTPUT_DIR"
 echo "=============================="
 
-/home/chenwh/miniconda3/envs/twyd/bin/swift sft \
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
+MAX_LENGTH=${MAX_LENGTH:-1024}
+SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
+
+"$SWIFT" sft \
     --model /home/chenwh/models/Llama-3.2-1B-Instruct \
     --dataset swift/ultrachat_200k#100000 \
     --tuner_type dense_lrc \
     --loss_type lrc_distill \
+    --attn_impl "$ATTN_IMPL" \
     --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
     --torch_dtype bfloat16 \
-    --max_length 1024 \
+    --max_length "$MAX_LENGTH" \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --learning_rate 1e-4 \
