@@ -45,6 +45,9 @@ class TwydLRCConfig:
     lora_layers: str = ""       # e.g. "0-8": 只在这些层挂 LoRA，其余保持 plain
     lora_lr: Optional[float] = None  # 补空间 LoRA 独立学习率（None=跟随全局 lr）
     freeze_col: bool = False    # CORE: 冻结 plain-LRC col path，只训补空间（CORE-LR）
+    rank_map: str = ""          # JSON dict or path: module name -> per-module k
+    factorized: bool = False    # CORE-LR: cached W_col + low-rank delta forward
+    perp_basis: str = "teacher"  # teacher | col (col = P6 equal-parameter control)
 
     def validate(self) -> None:
         assert self.branch in ("dense", "core", "plain"), f"branch={self.branch}"
@@ -56,6 +59,7 @@ class TwydLRCConfig:
             f"ridge_perp={self.ridge_perp}"
         assert self.master_p in ("none", "embed_svd"), f"master_p={self.master_p}"
         assert self.lora_mode in ("dense", "core"), f"lora_mode={self.lora_mode}"
+        assert self.perp_basis in ("teacher", "col"), f"perp_basis={self.perp_basis}"
 
 
 def parse_layer_range(spec: str, n_layers: int) -> set:
@@ -96,3 +100,64 @@ def layer_idx_of(mod_name: str) -> Optional[int]:
         except Exception:
             return None
     return None
+
+
+def parse_rank_map(spec, default: int = 0) -> dict:
+    """Parse ``TWYD_RANK_MAP`` into ``{module_key: k}``.
+
+    Accepted forms:
+      - JSON object string: ``'{"layers.0.mlp.gate_proj": 128, "down_proj": 64}'``
+      - path to a JSON file with the same object
+    Keys may be full module names, ``layers.N.mlp.proj`` suffixes, or a bare
+    projection name (``gate_proj``/``up_proj``/``down_proj``).  Resolution is
+    exact first, then longest suffix, then short name.
+    """
+    import json
+    import os
+
+    if spec is None or spec == "":
+        return {}
+    if isinstance(spec, dict):
+        raw = spec
+    else:
+        text = str(spec).strip()
+        if os.path.isfile(text):
+            with open(text, "r") as f:
+                raw = json.load(f)
+        else:
+            raw = json.loads(text)
+    out = {}
+    for k, v in (raw or {}).items():
+        try:
+            iv = int(v)
+        except Exception:
+            continue
+        if iv >= 0:
+            out[str(k)] = iv
+    return out
+
+
+def module_rank(rank_map: dict, mod_name: str, default: int = 0) -> int:
+    """Resolve a per-module rank with exact/suffix/layer+projection matching."""
+    if not rank_map:
+        return int(default)
+    name = str(mod_name)
+    if name in rank_map:
+        return int(rank_map[name])
+    short = name.split(".")[-1]
+    # longest suffix match: "layers.0.mlp.gate_proj" matches
+    # "model.layers.0.mlp.gate_proj"
+    for key in sorted(rank_map, key=len, reverse=True):
+        if name.endswith("." + key):
+            return int(rank_map[key])
+    # "layers.0.gate_proj" must still match "model.layers.0.mlp.gate_proj"
+    import re as _re
+    for key in sorted(rank_map, key=len, reverse=True):
+        m = _re.search(r"layers\.(\d+)\.", str(key))
+        key_short = str(key).split(".")[-1]
+        if (m and key_short == short and name.endswith("." + short)
+                and f"layers.{m.group(1)}." in name):
+            return int(rank_map[key])
+    if short in rank_map:
+        return int(rank_map[short])
+    return int(default)

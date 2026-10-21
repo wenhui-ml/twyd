@@ -64,12 +64,30 @@ def main() -> int:
     ap.add_argument("--r", type=int, default=1536, help="student hidden width (paper: 1536 for 3B)")
     ap.add_argument("--branch", default="dense", choices=["dense", "core", "plain"])
     ap.add_argument("--lora-rank", type=int, default=0, help="0 = full dense (paper); >0 = LoRA variant")
-    ap.add_argument("--warm-start", default="slice", choices=["slice", "ridge"])
+    ap.add_argument("--freeze-col", dest="freeze_col", action="store_true", default=None,
+                    help="freeze the plain-LRC col path (CORE-LR; default for --branch core, "
+                         "mirrors TWYD_FREEZE_COL=true in train_core_lr_pilot.sh)")
+    ap.add_argument("--no-freeze-col", dest="freeze_col", action="store_false",
+                    help="paper-exact full CORE: train Z_col together with Z_perp")
+    ap.add_argument("--lora-mode", default=None, choices=["dense", "core"],
+                    help="where the low-rank adapter lives: 'core' = CORE-LR "
+                         "(rank-k complement, what train_core_lr_pilot.sh builds), "
+                         "'dense' = Dense-LoRA. Default: core when "
+                         "--branch core and --lora-rank > 0, else dense.")
+    ap.add_argument("--warm-start", default="slice", choices=["slice", "ridge", "base"],
+                    help="slice / ridge / base (official width-r LRC checkpoint)")
     ap.add_argument("--master-p", default="none", choices=["none", "embed_svd"],
                     help="project embedding/attention/MLP onto embedding-SVD P")
     ap.add_argument("--head-mode", default="select", choices=["select", "merge"],
                     help="P attention head mapping: select first heads or average groups")
     ap.add_argument("--ridge-perp", default="residual", choices=["zero", "residual", "lowrank"])
+    ap.add_argument("--rank-map", default="", help="JSON dict/path: per-module CORE-LR k")
+    ap.add_argument("--perp-basis", default="teacher", choices=["teacher", "col"],
+                    help="teacher = true complement (CORE/CORE-LR); col = P6 "
+                         "equal-parameter control that writes the same number of "
+                         "coordinates back inside col(T) (paper §6.1)")
+    ap.add_argument("--factorized", action="store_true",
+                    help="use cached W_col + rank-k delta forward")
     ap.add_argument("--calib-ids", default=None, help=".pt/.npy/.jsonl/.txt for --warm-start ridge")
     ap.add_argument("--calib-seq-len", type=int, default=256)
     ap.add_argument("--calib-num-seqs", type=int, default=32)
@@ -79,13 +97,24 @@ def main() -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--max-ce", type=float, default=6.0)
     ap.add_argument("--min-cos", type=float, default=0.5)
+    ap.add_argument("--min-tok-acc", type=float, default=0.20,
+                    help="absolute floor on student token accuracy")
+    ap.add_argument("--min-agree", type=float, default=0.30,
+                    help="min top-1 agreement with teacher (basis-free)")
+    ap.add_argument("--min-acc-ratio", type=float, default=0.50,
+                    help="student tok_acc must be >= this fraction of teacher's")
+    ap.add_argument("--cos-check", action="store_true",
+                    help="also gate on hidden cosine; only valid for slice-type "
+                         "inits (a trained LRC base uses a different residual "
+                         "basis and scale, so cosine is meaningless there)")
     ap.add_argument("--text", default=None)
     args = ap.parse_args()
 
     from twyd.config import TwydLRCConfig
     from twyd.init import (build_master_P, calibrate_attention,
                            project_student_with_P_)
-    from twyd.tuner import (_TwydWrapper, _build_factorized_student,
+    from twyd.tuner import (DenseLinearLoRA, CoreLinearLoRA, _TwydWrapper,
+                            _build_factorized_student,
                             _freeze_for_branch, _hidden_of, _shrink_student_,
                             _student_head_layout)
 
@@ -123,15 +152,36 @@ def main() -> int:
         P = build_master_P(teacher, r)
         n_p = project_student_with_P_(student, teacher, P, head_mode=args.head_mode)
         print(f"[master-p] P={tuple(P.shape)} projected {n_p} tensors")
+    # The adapter placement decides what actually trains: --branch core with
+    # --lora-rank > 0 must be CORE-LR (rank-k complement), not Dense-LoRA.
+    # Before this flag existed, lora_mode silently stayed "dense", so the gate
+    # validated a different module than train_core_lr_pilot.sh builds.
+    lora_mode = args.lora_mode or ("core" if (args.branch == "core" and args.lora_rank > 0)
+                                   else "dense")
+    freeze_col = args.freeze_col if args.freeze_col is not None else (args.branch == "core")
     cfg = TwydLRCConfig(branch=args.branch, teacher_model=args.teacher, student_hidden=r,
                         stage="pt", warm_start=args.warm_start,
                         ridge_perp=args.ridge_perp, calib_ids=args.calib_ids,
                         calib_seq_len=args.calib_seq_len,
                         calib_num_seqs=args.calib_num_seqs,
-                        lora_rank=args.lora_rank,
+                        lora_rank=args.lora_rank, lora_mode=lora_mode,
+                        freeze_col=freeze_col,
+                        rank_map=args.rank_map,
+                        factorized=args.factorized,
+                        perp_basis=args.perp_basis,
                         target_modules=["gate_proj", "up_proj", "down_proj"])
     cfg.validate()
     meta = _build_factorized_student(student, teacher, cfg, branch=args.branch)
+    n_core_lr = sum(isinstance(m, CoreLinearLoRA) for m in student.modules())
+    n_dense_lora = sum(isinstance(m, DenseLinearLoRA) for m in student.modules())
+    print(f"[adapter] branch={args.branch} lora_mode={lora_mode} "
+          f"perp_basis={args.perp_basis} "
+          f"k={args.lora_rank} -> CORE-LR modules={n_core_lr}, "
+          f"Dense-LoRA modules={n_dense_lora}")
+    if args.branch == "core" and args.lora_rank > 0 and lora_mode == "core" and n_core_lr == 0:
+        print("[adapter] FAIL: CORE-LR requested but no CoreLinearLoRA was built "
+              "(check target_modules / rank / freeze_col).")
+        return 1
     wrapper = _TwydWrapper(student, teacher, cfg)
     wrapper.twyd_cfg = cfg
     wrapper.twyd_meta = meta
@@ -187,6 +237,26 @@ def main() -> int:
     print(f"[teacher] CE={t_ce:.3f} tok_acc={t_acc:.4f}")
     print(f"[student] CE={s_ce:.3f} tok_acc={s_acc:.4f}")
 
+    # Basis-free agreement: top-1 token match + symmetric KL on a common
+    # vocabulary slice.  This is what matters for a trained LRC base, whose
+    # residual basis and scale differ from the teacher's.
+    agree = kl_s = kl_t = None
+    try:
+        tl = t_out.logits.float()[..., :-1, :]
+        sl = s_out.logits.float()[..., :-1, :]
+        V = min(tl.size(-1), sl.size(-1))
+        tl, sl = tl[..., :V], sl[..., :V]
+        agree = (tl.argmax(-1) == sl.argmax(-1)).float().mean().item()
+        logp_t = F.log_softmax(tl, dim=-1)
+        logp_s = F.log_softmax(sl, dim=-1)
+        kl_st = F.kl_div(logp_s, logp_t, log_target=True, reduction="batchmean").item()
+        kl_ts = F.kl_div(logp_t, logp_s, log_target=True, reduction="batchmean").item()
+        kl_s = kl_st
+        kl_t = kl_ts
+        print(f"[logits] top1_agree={agree:.4f} KL(s||t)={kl_st:.4f} KL(t||s)={kl_ts:.4f}")
+    except Exception as e:
+        print(f"[logits] comparison skipped: {e}")
+
     cos_all = []
     step = max(1, len(shs) // 8)
     for l in range(0, min(len(shs), len(ths)), step):
@@ -203,13 +273,24 @@ def main() -> int:
               f"|s|={s.norm(dim=-1).mean():.2f} |t|={t.norm(dim=-1).mean():.2f}")
     mean_cos = sum(cos_all) / max(len(cos_all), 1)
 
-    ok = (s_ce <= args.max_ce) and (mean_cos >= args.min_cos)
+    ok = (s_ce <= args.max_ce) and (s_acc >= args.min_tok_acc)
+    if agree is not None:
+        ok = ok and (agree >= args.min_agree)
+    if t_acc > 0:
+        ok = ok and (s_acc >= args.min_acc_ratio * t_acc)
+    if args.cos_check:
+        ok = ok and (mean_cos >= args.min_cos)
     print(f"[gate] student_CE={s_ce:.3f} (<= {args.max_ce}) "
-          f"mean_cos={mean_cos:.3f} (>= {args.min_cos}) -> {'PASS' if ok else 'FAIL'}")
+          f"tok_acc={s_acc:.4f} (>= {args.min_tok_acc}, "
+          f">= {args.min_acc_ratio:.2f}x teacher={t_acc:.4f})"
+          + (f" agree={agree:.3f} (>= {args.min_agree})" if agree is not None else "")
+          + (f" mean_cos={mean_cos:.3f} (>= {args.min_cos})" if args.cos_check else
+             f" mean_cos={mean_cos:.3f} (informational)")
+          + f" -> {'PASS' if ok else 'FAIL'}")
     if not ok:
-        print("[gate] FAIL means the warm start is not tracking the teacher. Do not start "
-              "training; implement the data-aware SVD/ridge init (paper Alg.1 / App. A.4) "
-              "or the LRC co-training/convert path first.")
+        print("[gate] FAIL: the warm start is not tracking the teacher. Do not start "
+              "training; use an official LRC/PT width-r base (--warm-start base) or "
+              "implement the data-aware SVD/ridge init (paper Alg.1 / App. A.4).")
     return 0 if ok else 1
 
 

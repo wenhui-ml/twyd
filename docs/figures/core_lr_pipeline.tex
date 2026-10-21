@@ -1,0 +1,62 @@
+% CORE-LR: teacher-spectral reparameterization with a rank-k complement path.
+% Plain-LRC column path is frozen; only A (r x k) and B ((d_ff-H) x k) train.
+% Compile: pdflatex core_lr_pipeline.tex
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\begin{document}
+\begin{tikzpicture}[font=\sffamily\small,>=Latex,
+    box/.style={draw,rounded corners,align=center,inner sep=5pt},
+    op/.style={draw,fill=gray!6,rounded corners,align=center,inner sep=4pt},
+    arr/.style={->,thick}]
+
+  % ---------------- teacher spectral basis --------------------------------
+  \node[box,fill=blue!8] (svd)
+      {frozen teacher $W\in\mathbb{R}^{d_{ff}\times H}$\\[2pt]
+       $\;W=[\,T\ \ U_\perp\,]\,\mathrm{diag}(s)\,[\cdots]^{\top}$\\[2pt]
+       $T\in\mathbb{R}^{d_{ff}\times H}$,\quad
+       $U_\perp\in\mathbb{R}^{d_{ff}\times(d_{ff}-H)}$};
+
+  % ---------------- two paths ---------------------------------------------
+  \node[box,fill=blue!12,below left=14mm and 4mm of svd] (col)
+      {\textbf{column path} (plain LRC)\\[2pt]
+       $T\,Z_{col}^{\top}$\\[2pt]
+       $Z_{col}\in\mathbb{R}^{r\times H}$\\[2pt]
+       \textcolor{blue!55!black}{frozen in CORE-LR}};
+
+  \node[box,fill=orange!12,below right=14mm and 4mm of svd] (perp)
+      {\textbf{complement path} (rank-$k$)\\[2pt]
+       $U_\perp\,(AB^{\top})^{\top}$\\[2pt]
+       $A\in\mathbb{R}^{r\times k}$,\;
+       $B\in\mathbb{R}^{(d_{ff}-H)\times k}$\\[2pt]
+       $B=0$ at step 0};
+
+  \draw[arr] (svd.south) ++(-1.2,0) |- (col.north);
+  \draw[arr] (svd.south) ++( 1.2,0) |- (perp.north);
+
+  % ---------------- merge --------------------------------------------------
+  \node[op,below=20mm of $(col.south)!0.5!(perp.south)$] (merge)
+      {merge at export:\quad
+       $W_s=T Z_{col}^{\top}+U_\perp Z_\perp^{\top}$,\;\;
+       $Z_\perp=A B^{\top}\!\cdot\!(\alpha/k)$};
+  \draw[arr] (col.south) -- (merge.north -| col.south);
+  \draw[arr] (perp.south) -- (merge.north -| perp.south);
+
+  % ---------------- deploy -------------------------------------------------
+  \node[box,fill=green!9,below=9mm of merge] (deploy)
+      {one dense $d_{ff}\times r$ weight\\[2pt]
+       vLLM / TensorRT / edge runtime\\[2pt]
+       no new parameters, no new kernels};
+  \draw[arr] (merge) -- (deploy);
+
+  % ---------------- parameter ledger --------------------------------------
+  \node[draw,dashed,rounded corners,align=left,anchor=west]
+       at ($(deploy.east)+(8mm,0)$)
+       {trainable coordinates\\[2pt]
+        plain LRC: $rH$\\
+        full CORE: $r\,d_{ff}$\\
+        \textbf{CORE-LR}: $k\,(r+d_{ff}-H)$};
+
+\end{tikzpicture}
+\end{document}

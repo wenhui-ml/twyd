@@ -30,18 +30,19 @@ class FakeStudent(nn.Module):
 
 
 class FakeWrapper(nn.Module):
-    def __init__(self, hidden=4, vocab=8):
+    def __init__(self, hidden=4, vocab=8, teacher_hidden=None):
         super().__init__()
         self.twyd_cfg = TwydLRCConfig(use_aux=True, aux_weight=0.2,
                                       kl_temperature=2.0)
         self.student = FakeStudent(hidden, vocab)
+        self.teacher_hidden = int(teacher_hidden or hidden)
         self._twyd_last_inputs = {}
 
     def get_teacher_outputs(self, output_hidden_states=False, **kw):
         ids = kw["input_ids"]
         b, s = ids.shape
         assert output_hidden_states, "teacher hidden states must be requested when use_aux"
-        h = torch.randn(b, s, self.student.hidden)
+        h = torch.randn(b, s, self.teacher_hidden)
         return types.SimpleNamespace(logits=torch.randn(b, s, self.student.vocab),
                                      hidden_states=(h,))
 
@@ -49,6 +50,39 @@ class FakeWrapper(nn.Module):
 def test_aux_is_live_and_differentiable():
     torch.manual_seed(0)
     wrapper = FakeWrapper()
+    ids = torch.randint(0, 8, (1, 6))
+
+    class FakeTrainer:
+        model = wrapper
+        _twyd_inputs = {"input_ids": ids}
+
+        def _set(self, d):
+            self._twyd_last = d
+
+    trainer = FakeTrainer()
+    loss_fn = LrcDistillLoss(types.SimpleNamespace(), trainer)
+    out = wrapper.student(input_ids=ids)
+    loss = loss_fn(out, ids)
+    assert torch.isfinite(loss)
+    aux = trainer._twyd_last.get("aux")
+    assert aux is not None and aux >= 0.0, f"aux was not computed: {trainer._twyd_last}"
+    loss.backward()
+    assert wrapper.student.w.grad is not None
+    assert wrapper.student.w.grad.abs().sum() > 0
+
+
+def test_projection_fit_handles_underdetermined_system():
+    """r != H and N < r: CUDA lstsq refuses this shape, pinv must still map r->H."""
+    from twyd.loss import fit_hidden_projection
+
+    P = fit_hidden_projection(torch.randn(5, 8), torch.randn(5, 16))
+    assert P is not None and tuple(P.shape) == (8, 16)
+
+
+def test_aux_is_live_when_student_narrower_than_teacher():
+    """Width shrink (r=8 < H=16) with N=6 < r must not drop or broadcast L_align."""
+    torch.manual_seed(0)
+    wrapper = FakeWrapper(hidden=8, vocab=16, teacher_hidden=16)
     ids = torch.randint(0, 8, (1, 6))
 
     class FakeTrainer:

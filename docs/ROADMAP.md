@@ -1,314 +1,390 @@
-# TWYD on ms-swift：技术复现、CORE-LR、TWYD-MoE 与创业计划
+# TWYD Roadmap — Research, CORE-LR, TWYD-MoE
 
-> 目标：在 ms-swift 上把 TWYD 从“论文 + 私有代码”做成可复现、可开源、可融资的技术资产。
-> 原则：先让 step-0 初始化过 gate，再谈参数效率；先在小模型上拿到可信的 Pareto 曲线，再上 MoE 和大预算。
+> Goal: turn TWYD from "paper + private code" into a reproducible, open-source, fundable technical
+> asset on top of ms-swift.
+> Principle: pass the step-0 gate before arguing about parameter efficiency; get a believable Pareto
+> curve on small models before scaling to MoE and 10B-token budgets.
 
-## 0. 现状（2026-10）
+For the engineering reference see [`TECHNICAL.md`](TECHNICAL.md); for the investor narrative see
+[`../README.md`](../README.md).
 
-- 论文：`TWYD.pdf`（Llama3.2-3B→1.5B，r=1536；CORE-LRC 在 Qwen 上 +10.45 Avg9）。
-- 当前实现：`twyd/` + `_upstream/ms-swift`，`dense_lrc/core_lrc/plain_lrc` 注册正常，merge 正常。
-- 实际 run：`dense-lora128-r1024-ddp-2gpu-100k`，3B teacher、r=1024、LoRA rank=128、SFT-only 45M tokens。
-- 结果：step 1 `token_acc=1.9e-4`，1368 步后 13.2%；merged CE≈11.3、token acc=0；9 任务全部随机。
-- 根因：width-r 学生由 teacher 权重 top-left slice 构造，不是 LRC warm start；attention/embedding 冻结；aux 失效。
+---
 
-## 0.1 最新结论（2026-10-21）
+## 0. Status (October 2026)
 
-- **Qwen Table 8 是 CORE 的核心证据，但不是 teacher parity**：
-  `Qwen2.5-3B→1.7B, r=2048, ρ=5.375, stranded=81.4%`；teacher 69.11，
-  full CORE 10B PT 63.44，PT+SFT 63.82，Dense 10B 59.38，LRC 20B 63.43。
-  CORE 的承诺是 **2× token efficiency + 相对 matched LRC +10.45**。
-- **Llama 是效率对照**：`3B→1.5B, r=1536, ρ=2.67, stranded=62.5%`；
-  论文里 Dense/CORE tie，CORE-LR 目标是“更少坐标打平”，不强求超过 Dense。
-- **1B 从零构造仍未过 gate**：slice/MLP/P/attention ridge 都 FAIL；
-  现阶段必须先拿官方 LRC base / PT checkpoint，否则 dense/core 对比无效。
-- **CORE-LR 低秩假设尚未证明**：下一步的关键 gate 是
-  `k<=256` 逼近 full CORE，且可训坐标 `<=25%`、step time/optimizer memory 下降。
-- **FlashAttention/AOTriton**：2048 context 用 `twyd` + SDPA + AOTriton 即可，
-  不需要依赖 `flash_attn` 包；详见 `README.md` 的环境/2048 节。
-- **技术方案**（模型对、四阶段实验、rank allocator、factorized forward、Go/No-Go）
-  已写入 `README.md` 的 “CORE-LR 技术方案（2026-10）”。
+- Paper: *Train What You Deploy* (arXiv:2609.02006) — Llama3.2-3B→1.5B at r=1536; CORE-LRC gives
+  +10.45 Avg9 on Qwen2.5-3B→1.7B over the matched baseline (+6.39 same-lineage Dense).
+- Implementation: `twyd/` + `_upstream/ms-swift`; `plain_lrc` / `dense_lrc` / `core_lrc` registered,
+  merge/export verified, CORE-LR (rank-`k` complement) running end-to-end.
+- Actual runs: `output/fw-dense-pt20M`, `output/fw-corelr-k128-pt20M` — FineWeb-Edu score≥4,
+  20M tokens/arm, single 7900 XTX each.
+- Historical failure: the first `dense-lora128-r1024-ddp-2gpu-100k` run started from a teacher
+  top-left slice. At step 1 `token_acc=1.9e-4`; after 1368 steps 13.2%; merged CE≈11.3, token acc 0;
+  all 9 tasks at chance. Root cause: no LRC warm start, attention/embedding frozen, aux inert.
 
-## 1. 技术判断：TWYD-LR 应该是 CORE-LR，不是 dense-LoRA
+## 0.1 Latest conclusions (2026-10-21)
 
-论文的可达集论证（r=1536，H=3072，d_ff=8192，L=28，3 个 MLP 投影）：
+- **Qwen Table 8 is CORE's core evidence but not teacher parity.** Qwen2.5-3B→1.7B, r=1200, ρ=5.375,
+  stranded 81.4%: teacher 69.11, full CORE 10B PT 63.44, PT+SFT 63.82, Dense 10B 59.38, LRC 20B
+  63.43. CORE's promise is **2× token efficiency + 10.45 over matched LRC**, not 69.11.
+- **Llama is the efficiency control.** 3B→1.5B, r=1536, ρ=2.67, stranded 62.5%; the paper reports
+  Dense ≈ CORE (+2.36 over plain LRC). CORE-LR's target here is "match full CORE with fewer
+  coordinates", not "beat Dense".
+- **Zero-PT construction from scratch still fails the gate** on 1B (slice/MLP/P/attention ridge all
+  FAIL). The only validated starting point is an official width-`r` LRC base with `warm_start=base`.
+- **The low-rank hypothesis is unproven.** The next decisive gate is `k ≤ 256` within 0.5 Avg9 of full
+  CORE, with trainable coordinates ≤ 25% of full CORE and a real step-time / optimizer-memory win.
+- **AOTriton is enough for 2048 context** on the 7900 XTX: SDPA 0.588 s/step vs flash_attn Triton
+  0.643 s/step at `seq=1938`; peak is identical at 15.02 GiB with a 1B teacher. Whole-step peak is set
+  by teacher/MLP/logits, not attention.
+- **Fixed (2026-10-21):** `CoreLinearLoRA` used to zero-init both `A` and `B`, so `grad_norm` was
+  identically 0 and CORE-LR never learned. Now `A` random / `B` zero with a regression test.
+  **Every earlier CORE-LR/right-side/rank result with `grad_norm=0` must be re-run.**
 
-| 方案 | 每个 MLP 可训坐标 | 总可训 | 占 dense | 更新秩 |
-|---|---:|---:|---:|---:|
+## 0.2 Execution log (2026-10-21 evening)
+
+- **Stage 1/2 launched**: two arms in parallel, same budget (20M tokens, `seq=512`, effective
+  16k tokens/step, `lr=1e-4`, `T=40`, `USE_AUX=0`):
+  - P1 Dense-LRC → `output/fw-dense-pt20M` (~1.8k tok/s, 8.98 s/step, 17.3 GiB)
+  - P3 CORE-LR k=128 factorized + frozen column → `output/fw-corelr-k128-pt20M` (~2.5k tok/s)
+- **Gate isomorphism bug (fixed).** `check_init.py` never passed `lora_mode`, so
+  `--branch core --lora-rank 128` actually built Dense-LoRA (104.6M) instead of CORE-LR (71.6M).
+  Defaults are now `core + freeze_col`, and the script prints
+  `[adapter] ... CORE-LR modules=84, Dense-LoRA modules=0`.
+- **Aux loss was silently off (fixed).** `torch.linalg.lstsq` only accepts over-determined systems on
+  ROCm; with `seq×batch < r` it raised and the outer `except` swallowed it. Now over/under-determined
+  paths (`lstsq` / `pinv`) + a shape guard + a one-time log line. **All earlier `lambda_aux=0.2` runs
+  were effectively `aux=0`.**
+- **Merge parity** (`scripts/check_merge_parity.py`): exported weights are exact (`max|ΔW|=0`), but
+  the factorized training graph and the deployed merged graph differ by ~1.8% relative in bf16 logits
+  (max 0.375, logit scale ≈20). → **evaluate merged checkpoints only.**
+- **P6 equal-parameter control implemented** (paper §6.1): `TWYD_PERP_BASIS=col` maps the complement
+  coordinates back into `col(T)` (`basis_perp = T @ A`, fixed random), so the coordinate count matches
+  CORE-LR while the reachable set stays inside the teacher slice. Test:
+  `test_col_completion_control_same_params_but_no_new_directions`.
+- **Still missing**: factorized forward for `CoreLinear` (full CORE rebuilds `d_ff×r` every step,
+  4.4× dense, 11.2 GiB of bases); `lora_lr` is not wired into the optimizer; `L_align` only covers 4
+  layers of hidden MSE (no attention / MLP-intermediate terms).
+
+## 0.3 Data pipeline (2026-10-21, critical fix)
+
+- **`truncation_strategy=delete` silently drops data.** ms-swift deletes every sample longer than
+  `max_length`; a 35M-token ultrachat PT corpus collapsed to **2,992 samples** (avg 384 tokens) at
+  `max_length=512`, so "20M tokens" was really ~1.1M unique tokens repeated ~18 epochs. The pilot
+  script now defaults to `TRUNC=split`: long samples become multiple `max_length` chunks (first token
+  of each chunk masked), no content lost, no cross-document attention.
+- **Corpus switched to the paper's data family.** From the ModelScope mirror of FineWeb-Edu
+  (`CC-MAIN-2013-20/train-00000-of-00014.parquet`, 2.37 GB, 785,906 docs), `int_score>=4` yields
+  **111,885 docs / 130.2M tokens**; the first **51,390 docs / 60.0M tokens** became
+  `data/fineweb_edu_score4_60M.jsonl` (267 MB), i.e. **140,805 chunks of 512 tokens (59.1M tokens,
+  nothing dropped)** after `split`.
+- Both current arms train on that corpus: 20M tokens = 1220 steps × 16,384 ≈ 1/3 epoch.
+
+---
+
+## 1. Why CORE-LR and not dense-LoRA
+
+Reachable-set accounting for Llama-3.2-3B→1.5B (`r=1536`, `H=3072`, `d_ff=8192`, `L=28`, three MLP
+projections per layer):
+
+| Variant | Trainable / projection | Total | vs deployed | Update rank |
+|---|---:|---:|---:|---|
 | plain LRC `T Z_col^T` | rH = 4.72M | 396M | 37.5% | ≤ r |
-| Dense-LRC 全矩阵 | r·d_ff = 12.58M | 1.057B | 100% | 满秩 |
-| CORE 全补空间 | r(d_ff−H) = 7.86M | 661M | 62.5% | ≤ r |
+| Dense-LRC (full matrix) | r·d_ff = 12.58M | 1057M | 100% | full |
+| CORE (full complement) | r(d_ff−H) = 7.86M | 661M | 62.5% | ≤ r |
 | **CORE-LR k=128** | 0.85M | **71.6M** | **6.8%** | ≤ k |
 | CORE-LR k=256 | 1.70M | 143M | 13.5% | ≤ k |
 | CORE-LR k=512 | 3.41M | 286M | 27.1% | ≤ k |
 | dense-LoRA k=128 | 1.25M | 105M | 9.9% | ≤ k |
 
-> CORE-LR 假设 col path `T Z_col^T` 已由 plain LRC 冻结/预训练；若同时训 col，加上 plain LRC 的 396M（r=1536）。
-> k 的有效上限是 `min(r, d_ff−H)`；k=r 时 `A B^T` 因子化是冗余的，会退化到接近 dense 的参数量。
+1. **dense-LoRA is not the TWYD philosophy.** It trains `W0 + A B^T`; the update rank is `k < r`, so
+   its reachable set is *smaller* than plain LRC's. It is PEFT on a dense weight, not an opening of the
+   stranded complement.
+2. **CORE-LR is TWYD-native.** `W = T Z_col^T + U_perp (A B^T)^T`; every trainable coordinate lives in
+   `col(T)^⊥`; merge returns a `d_ff×r` dense matrix with zero inference overhead.
+3. **At equal `k`, CORE-LR is cheaper than dense-LoRA** (`d_ff−H=5120 < d_ff=8192`) and it spends its
+   coordinates on the directions the teacher has but plain LRC cannot reach.
+4. **The questions that decide the thesis**: CORE-LR rank sweep, per-layer rank allocation, and an
+   equal-parameter control restricted to `col(T)` (P6) — only these separate "reachable set" from
+   "more parameters".
 
-关键结论：
-
-1. **dense-LoRA 不是 TWYD 哲学**。它训练的是 `W0 + A B^T`，更新秩只有 k；k=128 < r=1536，可达集反而比 plain LRC 更小。它只是“在 dense 权重上做 PEFT”，没有打开 5120 维的 stranded complement。
-2. **CORE-LR 是 TWYD-native 的高效变体**：`W = T Z_col^T + U⊥ (A B^T)^T`，所有可训坐标都在 `col(T)^⊥`，merge 后仍是一个 `d_ff×r` dense 矩阵，推理零新增。
-3. 同一 k 下，CORE-LR 比 dense-LoRA 更省（`d_ff−H=5120 < d_ff=8192`），而且方向选在“老师有、plain LRC 学不到”的补空间，假设更干净。
-4. 研究方向：**CORE-LR rank sweep + 层级 rank 分配 + 等参数对照（把同样的坐标限制在 col(T)）**，才能回答“增益来自可达集还是参数量”。
-
-## 2. Phase 0（1–2 周）：让初始化过 gate
-
-验收标准（`scripts/check_init.py`）：
-
-- student CE ≤ 6.0（teacher≈2，均匀≈11.76）
-- 逐层 mean cosine ≥ 0.5（当前 r=1536 只有 0.144）
-- token_acc ≥ 0.20
-
-任务：
-
-- [x] 实现论文 Alg.1 / App. A.4 的 MLP warm start：
-  - [ ] embedding SVD → `P ∈ R^{r×H}`：`build_master_P` + `project_student_with_P_` 已实现（head-aware），但 1B 真实 gate 仍未通过；默认关闭
-  - 逐层 greedy：teacher/student 同层前向，streaming `C^T C` / `C^T H_T`，拟合 deployed `W` 后分解 `Z_col` / `Z_perp`
-  - `scripts/calib_ridge.py --synthetic` 与 `tests/test_ridge_calib.py` 已通过（38 tests）
-  - 训练路径：`warm_start="ridge"`（在线校准）或 `warm_start="ridge_ckpt"`（离线 `.pt` / merged HF）
-  - `pt_ckpt` SFT 现在也会保留 PT 合并权重里的补空间残差（`ridge_perp != zero`）
-- [ ] 真实 1B gate 结论（2026-10-20）：slice CE 11.90/cos 0.168 → MLP ridge 11.15/0.219，仍 FAIL；P select 11.95/0.146；P merge 11.76/0.171；P+ridge 15.60/0.114；P+attn ridge+MLP ridge 15.88/0.117。**线性 MLP/P/attention ridge 都不足以从零构造学生，attention 语义耦合是 blocker**；优先用官方 LRC base，或实现论文的 attention zoom / LRC co-training
-- [ ] attention 用 LRC 的 zoom/ridge；当前只校准 MLP gate/up/down（论文 App. B 的默认 target）
-- [ ] 若时间紧：直接用官方 LowRankClone `CoTrainLM` + `convert_ckpt.py` 产出一个 width-r checkpoint，作为 `--base`/`--pt_ckpt`
-- [ ] 固定 `r=1536`（不是 1024）；`--model` 用 3B（或官方 1.5B LRC ckpt），不要 1B+3B
-- [ ] 加 logit parity：live wrapper vs reload merged，`max_abs_diff < 1e-2`
-
-
-## 3. Phase 1（2–4 周）：TWYD-LR / CORE-LR 实验矩阵
-
-先在小模型上跑通，再放大。建议 pilot：Llama-3.2-1B teacher → r=512/768 student，0.2–0.5B tokens；或 3B→1.5B（r=1536）0.3B tokens 的短跑。
-
-### 3.1 变体
-
-| 代号 | 参数化 | 目的 |
-|---|---|---|
-| P0 | plain LRC `T Z_col^T` | 官方 baseline |
-| P1 | Dense 全矩阵 | 论文主方法（上限） |
-| P2 | CORE full `Z⊥` | 论文高效实现 |
-| P3 | **CORE-LR(k)** `Z⊥=A B^T`，k=64/128/256/512/1024 | 你的核心创新：效率前沿 |
-| P4 | dense-LoRA(k) | PEFT 对照（不是 TWYD-native） |
-| P5 | CORE-LR + 层级 rank 分配 | 第二个创新点 |
-| P6 | 等参数对照：同样 k 的坐标限制在 col(T) | 排除“纯加参数”解释（论文 §6.1） |
-
-### 3.2 指标
-
-- 语言建模：CE / token_acc / PPL（teacher、P0–P6 同一 batch）
-- 下游：Avg9（ARC-E/C、LogiQA、CSQA、PIQA、WinoGrande、BoolQ、SciQ、MMLU），0-shot、同一 lm-eval 版本
-- 成本：可训坐标、GPU 小时、峰值显存、tokens-to-target
-- 结构：`u = 可训坐标 / (r·d_ff)`、每层 rank、merge parity、生成退化检查
-- 统计：至少 2 seeds；报告均值/极差；单 seed 只用于 debug
-
-### 3.3 关键消融
-
-1. **rank sweep**：CORE-LR k 从 64 到 r，画“eval vs 可训坐标”的 Pareto 曲线；预期在 k≈256–512 出现拐点。
-2. **层级分配**：用校准集的梯度/激活 eRank 估计每层补空间的重要性，`k_l ∝ score_l`，总预算固定；对比 uniform rank。
-3. **等参数对照 P6**：同样的 k、同样的参数量，但限制在 col(T)，验证增益来自补空间而不是参数量。
-4. **basis 选择**：teacher SVD `U⊥` vs 随机正交补 vs 数据感知 P；验证是否“basis 不 privileged”（论文结论）。
-5. **SFT vs PT**：先 PT 再 SFT；不要用 SFT-only 45M token 下结论。
-
-### 3.4 现实算力
-
-当前 2×7900 XTX：45M tokens 约 2.3h。0.5B tokens ≈ 25h；1B ≈ 50h；10B ≈ 500h（约 21 天）。
-所以：
-
-- Phase 1 用 0.2–0.5B tokens 的 pilot（1B teacher / r=512–768），先看趋势；
-- 复现论文 3B→1.5B 的 10B PT 需要租 A100/H100 或融资后做，不要在 2 卡上硬跑；
-- 商业计划书里写“pilot 的 Pareto 曲线 + 租赁算力的 scaling 预算”，不要承诺 2 卡 10B。
-
-## 4. Phase 2（6–10 周）：TWYD-MoE
-
-### 4.1 设定
-
-先做 **MoE teacher → 更窄 MoE student**（保留专家数与路由），而不是 dense→MoE。候选小模型：
-
-- OLMoE-1B-7B（64 experts, top-8）：单机可跑，社区 eval 完整
-- Qwen1.5-MoE-A2.7B（60 experts, top-4）：中文/多语言友好
-- DeepSeek-MoE-16B：更大，融资后
-
-### 4.2 研究点
-
-1. **per-expert reachability**：每个 expert 的 MLP 都是 `d_ff×r`；统计每个 expert 的 eRank / 负载 / 补空间能量，验证“长尾 expert 的 stranded capacity 更大还是更小”。
-2. **router-aware CORE-LR**：`k_e ∝ load_e` 或 `k_e ∝ gradient_e`；总补空间预算固定；对比 uniform-k。
-3. **shared expert 优先**：shared expert 一直激活，先开它的 complement；expert 层再按负载分配。
-4. **mergeable**：训练后把 `U⊥ Z⊥^T` 折进每个 expert 的 `d_ff×r` 权重；推理 FLOPs/显存不变，路由不变。
-5. **router 蒸馏**：student router 输入维度变了，需要 P；用 teacher 的 top-k routing distribution 做 KL，加 load-balance 正则。
-6. **basis 共享**：每 expert 存 `U⊥` 内存爆炸（L×E×d_ff×(d_ff−H)）；研究 expert 间子空间重叠，尝试共享 basis + per-expert coefficients，或按 expert cluster 共享。
-
-### 4.3 验收
-
-- 同参数量下，MoE student 的 Avg9 / 困惑度 / 专家负载不劣化；
-- 训练显存/时间可接受（至少 1B 级 MoE pilot）；
-- merge 后推理吞吐与原始 width-r MoE 一致；
-- 给出“每 expert 可训坐标 vs 增益”的曲线，作为第二个商业 proof point。
-
-## 5. Phase 3：产品化 / 开源 / 融资
-
-### 5.1 IP 与合规（先做，不要跳过）
-
-- 你和前司的劳动合同/知识产权归属条款；TWYD 论文、代码、实验记录是否属于职务成果；
-- `_upstream/LowRankClone` 的 license（读 LICENSE，不要默认 MIT/Apache）；ms-swift 是 Apache-2.0；
-- 创业公司代码要 clean-room：只依据公开论文 + 公开 repo 的接口/算法重写，不复制前司私有代码/数据/权重；
-- 找律师做一次 IP opinion；融资尽调一定会问“论文归谁、代码是否原创、训练数据授权”。
-- 在 README/仓库中记录 provenance（论文、公开 repo、license、独立实现声明）。
-
-### 5.2 开源策略
-
-- 开源：ms-swift plugin、CORE-LR 实现、eval/复现脚本、pilot 权重（如 license 允许）；Apache-2.0；
-- 保留：数据管线、MoE 调度/rank 分配、评测 harness、领域数据与客户适配；
-- 不做“又一个 LoRA”叙事；做“可证明的 reachability + 零推理开销 + 可合并”的压缩/蒸馏工具链。
-
-### 5.3 融资叙事
-
-- 问题：企业要在固定推理成本下提升模型能力；MoE/大模型的训练参数浪费在不可达方向；
-- 方案：TWYD / CORE-LR 在**不增加推理成本**的前提下，把训练预算花在“部署矩阵真正能到达”的方向；
-- 证据：同一 harness 的 Pareto 曲线（plain/dense/CORE/CORE-LR）、tokens-to-target、GPU 小时、merge parity；
-- 壁垒：评测/数据管线 + MoE rank 分配 + 可复现的工程实现；不是单个公式；
-- 里程碑：M0 gate + pilot（1–2 月）→ M1 CORE-LR Pareto（2–3 月）→ M2 MoE pilot（4–6 月）→ 融资/客户 POC。
-
-> 详细的客户、产品形态、商业模式、90 天/12 个月里程碑、融资与护城河见 §7。
-
-## 6. 本周就做的 5 件事
-
-1. 跑 `scripts/check_init.py`，把 r=1536 的 FAIL 记录成 issue；在 gate 通过前冻结所有训练。
-2. 选 A 或 B：A=官方 LRC convert 产出 1.5B ckpt；B=实现 Alg.1 ridge。先做 A，最快拿到可信 baseline。
-3. 固定 pilot：1B teacher→r=512/768，0.2B tokens，plain vs dense vs CORE vs CORE-LR(128/256/512)，2 seeds。
-4. 加 `scripts/param_budget.py` 到实验报告；每个 run 记录可训坐标、GPU 小时、merge parity、CE/acc。
-5. 写 2 页技术 memo（给融资/合作方）：问题、方法、Pareto 图、复现命令、IP 声明。
-
-## 7. 创业计划（CORE-LR 楔子，TWYD-MoE 扩张）
-
-> 技术是楔子，不是公司。公司卖的是“**同样的任务质量，更低的训练/部署成本**”，
-> 不是“一个 rank 公式”。
-
-### 7.1 一句话定位
-
-> **TWYD 让企业用更少的训练参数和显存，把 Qwen/Llama 压缩成可部署的小模型；
-> 训练只学关键补空间，推理零额外开销，并可扩展到 MoE。**
-
-### 7.2 客户与楔子
-
-优先级：
-
-1. **私有化/行业模型团队**：有 Qwen/Llama 教师、需要 1.5B–2B 级可部署学生；
-2. **中文企业知识库/客服/金融/医疗**：成本敏感、数据不能出域；
-3. **边缘/端侧**：参数量、显存、推理延迟有硬约束；
-4. **MoE 团队**：已有 MoE 教师，想把 expert MLP 的 stranded capacity 用起来。
-
-第一个 wedge 不要做“通用大模型压缩平台”，而是：
-
-```text
-一个行业 + 一个教师模型 + 一个 1.5B–2B 学生 + 一套 eval
+```mermaid
+flowchart LR
+    A["capacity ledger<br/>deployed r*d_ff"] --> B{"where do the<br/>trainable coords live?"}
+    B -->|"inside col(T)"| C["plain LRC<br/>dense-LoRA<br/>P6 control<br/>reachable set unchanged"]
+    B -->|"inside col(T)^perp"| D["Dense-LRC<br/>CORE<br/>CORE-LR(k)<br/>stranded capacity opened"]
+    D --> E["merge to one d_ff x r weight"]
+    E --> F["0 extra params<br/>0 extra FLOPs"]
 ```
 
-### 7.3 产品形态
+## 2. Phase 0 (1–2 weeks): make the initialization pass the gate
 
-- **开源核心**：ms-swift plugin、CORE-LR、merge/eval/复现脚本（Apache-2.0）。
-- **商业层**：
-  - rank allocator（per-layer / per-projection / per-expert）；
-  - factorized CORE kernel（真实训练成本下降）；
-  - MoE router-aware allocation；
-  - 领域数据/校准/评测管线；
-  - 企业适配与支持。
+Acceptance (`scripts/check_init.py`): student CE ≤ 6.0; token accuracy ≥ 0.20 and ≥ 0.5× teacher;
+top-1 agreement with teacher ≥ 0.30. Cosine ≥ 0.5 only with `--cos-check`, and only for slice-type
+inits (a trained LRC base legitimately measures ≈0).
 
-### 7.4 必须拿出的 proof points
+- [x] Paper Alg.1 / App. A.4 MLP warm start:
+  - [ ] embedding SVD → `P ∈ R^{r×H}`: `build_master_P` + `project_student_with_P_` implemented
+    (head-aware), but the 1B real gate still fails; disabled by default.
+  - [x] per-layer greedy streaming `C^T C` / `C^T H_T`, fit the deployed `W`, split into `Z_col` /
+    `Z_perp` (`scripts/calib_ridge.py`, `tests/test_ridge_calib.py`, 38 tests).
+  - [x] `warm_start=ridge` (online) and `ridge_ckpt` (offline `.pt` / merged HF).
+- [x] Official width-`r` LRC base wired (2026-10-21): `JitaiHao/LRC-1.5B-Base` (Llama-3.2-3B teacher,
+  hidden 1536 / 24 heads / 8 kv) with `--model <LRC> --model_type llama --template llama3_2
+  WARM_START=base`. The official LRC keeps the teacher's head count and only compresses the residual
+  width (`q_proj (3072,1536)`, `k_proj (1024,1536)`, `o_proj (1536,3072)`).
+  Measured: teacher CE 3.084 / tok_acc 0.500; student CE 3.180 / tok_acc 0.474 / agreement 0.795 → PASS.
+- [x] Gate on CE + token accuracy + top-1 agreement (basis-free), not on hidden cosine.
+- [x] Teacher SVD basis disk cache (`TWYD_BASIS_CACHE_DIR`, default `~/.cache/twyd/basis`):
+  1.70 s → 0.02 s per projection.
+- [x] Real 1.5B + 3B CORE-LR end-to-end (`K=128 FACTORIZED=1 WARM_START=base`): 71.57M trainable
+  (7.03%), checkpoint is a clean dense LRC (`gate_proj (8192,1536)`, no `z_col`/`zoom` residue) and
+  loads with `transformers.from_pretrained`.
+- [x] Two fatal bugs (2026-10-21): teacher re-copied over PCIe every step (3.18 → 0.63 s/step after
+  pinning); bf16 KL produced a negative loss (fp32 chunked KL, locked by `test_kl_numerics.py`).
+- [x] `FACTORIZED=1` is the only CORE-LR shape that is not significantly slower (1.21× dense per
+  layer; merged 3.67×, full CORE 4.42×).
+- [ ] Real 1B from-scratch gate (2026-10-20): slice CE 11.90/cos 0.168 → MLP ridge 11.15/0.219, still
+  FAIL; P select 11.95/0.146; P merge 11.76/0.171; P+ridge 15.60/0.114; P+attention ridge+MLP ridge
+  15.88/0.117. **Linear MLP/P/attention ridge cannot construct a student from scratch**; attention
+  semantics are the blocker. Validated path: official LRC base + `warm_start=base`.
+- [ ] Attention warm start via LRC zoom/ridge (currently only MLP gate/up/down).
+- [ ] If time-constrained: produce a width-`r` checkpoint with the official LowRankClone `CoTrainLM` +
+  `scripts/convert_ckpt.py`, then use it as `--base` / `--pt_ckpt`.
+- [ ] Pin `r=1536` (not 1024); use the 3B model (or the official 1.5B LRC ckpt), not 1B+3B.
+- [ ] Logit parity gate in CI (see `scripts/check_merge_parity.py`).
 
-1. **Qwen2.5 3B→1.7B r=2048**：
-   - full CORE 10B PT 63.44 / PT+SFT 63.82（论文参考）；
-   - CORE-LR(k<=256) 与 full CORE 差距 <=0.5；
-   - 可训坐标 <= full CORE 的 25%；
-   - step time 或 optimizer memory 明显下降。
-2. **Llama 3.2 3B→1.5B r=1536**：
-   - CORE-LR 用更少坐标打平 Dense/full CORE；
-   - 证明方法不是 Qwen 特例。
-3. **部署**：
-   - merge 后是普通 dense width-r 模型；
-   - 推理框架零改动；
-   - prefill/decode 延迟、显存、吞吐有实测。
-4. **MoE pilot**：
-   - per-expert rank 优于 uniform rank（同总预算）；
-   - merge 后路由/输出一致。
+## 3. Phase 1 (2–4 weeks): the CORE-LR experiment matrix
 
-### 7.5 商业模式
+Pilot on small models first. Recommended: Llama-3.2-1B teacher → r=512/768 student, 0.2–0.5B tokens;
+or 3B→1.5B (r=1536) with a 0.3B-token short run. On this repo's hardware the realistic screening budget
+is 20–50M tokens per arm.
 
-- **License**：企业版插件 + rank allocator + MoE 模块；
-- **压缩服务**：按模型/项目交付，包含 eval 和部署验证；
-- **订阅/支持**：模型升级、数据/评测管线、私有化部署；
-- **联合研发**：与云厂商/模型厂商/行业 ISV 合作。
+### 3.1 Arms
 
-不要按“训练 token 数”收费；按“交付的模型质量 + 成本节省 + 部署价值”收费。
-
-### 7.6 里程碑
-
-#### 0–90 天（Pre-seed 证据）
-
-- G0：官方 LRC base 过 gate；
-- G1：Qwen 代理 full CORE 复现 CORE > Dense；
-- G2：CORE-LR(k<=256) 逼近 full CORE；
-- G3：factorized forward 让 step time/optimizer memory 下降；
-- 2 个 design partners 的领域 eval；
-- 一页 Pareto 图 + 一页成本模型。
-
-#### 3–6 个月（Seed 证据）
-
-- Qwen/Llama 目标规模 0.2–0.5B token 放大；
-- 一个客户 POC：同质量、训练成本降低、部署零额外开销；
-- MoE pilot：per-expert rank 可行；
-- 开源 repo 有外部用户/issue/PR。
-
-#### 6–12 个月（A 轮叙事）
-
-- 2–3 个付费客户/LOI；
-- MoE 压缩 recipe；
-- 模型 zoo（Qwen/Llama/领域模型）；
-- 可复现的 tokens-to-target / $/quality 证据。
-
-### 7.7 融资阶段与资金用途
-
-- **Pre-seed**：技术 de-risk + 2 个 design partners；资金用于 GPU/云、1–2 名工程师、IP/法务。
-- **Seed**：CORE-LR 目标规模 + MoE pilot + 客户 POC；资金用于算力、BD、评测/数据。
-- **A 轮**：模型 zoo + 商业化；资金用于销售、算力、MoE 规模化。
-- 不要在 2×7900 XTX 上承诺 10B 全量；把“租赁算力/云 GPU”写进预算。
-
-### 7.8 护城河
-
-公式是公开的，CORE 本身不是护城河。护城河是：
-
-1. **rank allocator**：per-layer / per-projection / per-expert 的预算分配；
-2. **factorized CORE execution**：真实训练成本下降的工程实现；
-3. **MoE router-aware allocation**：expert 负载/梯度/子空间共享；
-4. **评测/数据/校准管线**：可复现的 Pareto 和客户 eval；
-5. **ms-swift/HF 集成**：一键训练、merge、部署；
-6. **模型 zoo / 领域 recipe**：Qwen/Llama/行业模型的可复用配方。
-
-### 7.9 风险与 Go/No-Go
-
-| 风险 | 触发条件 | 应对 |
+| ID | Parameterization | Purpose |
 |---|---|---|
-| CORE-LR 低秩不成立 | k 必须 1024–2048 才接近 full CORE | 退回 full CORE/服务化，或改结构化低秩 |
-| Qwen teacher gap 被误读 | 把 63.8 当成应到 69.1 | 明确“vs full CORE/20B LRC”指标 |
-| attention/embedding 是瓶颈 | 逐层 cosine 在早期就崩 | attention zoom / LRC co-training / 容量 |
-| 2 卡算力不足 | 10B 全量不可行 | 代理模型 + 论文 checkpoint + 租卡 |
-| 前司 IP 风险 | 代码/权重/数据来源不清 | clean-room、license 审核、律师 opinion |
-| MoE 分散主线 | dense 未过 G2 就做 MoE | 冻结 MoE，直到 G2/G3 通过 |
+| P0 | plain LRC `T Z_col^T` | official baseline |
+| P1 | Dense (full matrix) | paper's main method / upper bound |
+| P2 | full CORE `Z⊥` (column frozen) | the *correct* reference for CORE-LR |
+| P2′ | full CORE, column trainable | paper-exact realization (1.057B coordinates) |
+| P3 | **CORE-LR(k)** `Z⊥=A B^T`, k=64/128/256/512 | core contribution: the efficiency frontier |
+| P4 | dense-LoRA(k) | PEFT control (not TWYD-native) |
+| P5 | CORE-LR + per-layer rank allocation | second contribution |
+| P6 | equal-parameter control confined to `col(T)` | excludes the "just more parameters" explanation (§6.1) |
 
-### 7.10 不做什么
+Run any of them with the same script:
 
-- 不做“又一个 LoRA”；
-- 不承诺 Qwen teacher parity；
-- 不把“参数少”直接等同于“推理快”；
-- 不在 dense CORE-LR 未证明前做大规模 MoE；
-- 不使用前司未公开的代码/权重/数据；
-- 不在 2 卡上硬跑 10B 全量。
-
-### 7.11 一页 pitch
-
-```text
-问题：企业要在固定推理成本下提升模型能力；full CORE/大模型训练浪费在不可达方向。
-方案：CORE-LR 只学关键补空间 + rank allocator + factorized execution；
-      部署仍是普通 dense 小模型，推理零额外开销；MoE 按 expert 分配 rank。
-证据：Qwen 3B→1.7B full CORE 10B 追平 20B LRC；CORE-LR k<=256 逼近 full CORE；
-      Llama 作为效率对照；merge parity + 实测训练/推理成本。
-壁垒：allocator + factorized kernel + MoE + eval/data + ms-swift 集成。
-阶段：Pre-seed 证据（90 天）→ Seed 客户 POC（6 个月）→ A 轮模型 zoo/MoE（12 个月）。
+```bash
+# P1 Dense-LRC
+BRANCH=dense K=0 LORA_MODE=dense bash scripts/train_core_lr_pilot.sh
+# P2 full CORE, frozen column (the reference for G2)
+BRANCH=core  K=0 FREEZE_COL=true bash scripts/train_core_lr_pilot.sh
+# P3 CORE-LR(k)
+BRANCH=core  K=128 LORA_MODE=core FREEZE_COL=true FACTORIZED=1 ALPHA=128 \
+  bash scripts/train_core_lr_pilot.sh
+# P6 equal-parameter col(T) control
+BRANCH=core  K=128 LORA_MODE=core FREEZE_COL=true FACTORIZED=1 PERP_BASIS=col \
+  bash scripts/train_core_lr_pilot.sh
 ```
+
+### 3.2 Metrics
+
+- Language modeling: CE / token accuracy / perplexity on a held-out shard (same batch for all arms).
+- Downstream: Avg9 (ARC-E/C, LogiQA, CSQA, PIQA, WinoGrande, BoolQ, SciQ, MMLU), 0-shot, one harness
+  (`lm_eval run --tasks arc_easy,arc_challenge,logiqa,commonsense_qa,piqa,winogrande,boolq,sciq,mmlu
+  --num_fewshot 0`).
+- Cost: trainable coordinates, optimizer state bytes, peak VRAM, s/step, merge parity.
+- Structure: complement occupancy (% energy in `col(T)^⊥`), stable rank / eRank / top-k energy of
+  `Z⊥`, per-layer profile.
+
+### 3.3 Research questions
+
+1. **Rank sweep**: k from 64 to r, plot eval vs trainable coordinates; expected knee at k≈256–512.
+2. **Per-layer allocation**: score each layer/projection from calibration gradients or activation
+   eRank, set `k_l ∝ score_l` under a fixed total budget, and compare with uniform rank
+   (`TWYD_RANK_MAP` already supports per-module `k`).
+3. **P6 equal-parameter control**: same `k`, same coordinate count, restricted to `col(T)` — verifies
+   the gain comes from the reachable set, not from parameter count.
+4. **Basis choice**: teacher SVD `U⊥` vs a random ambient completion vs a data-aware `P` — tests the
+   paper's "the basis is not privileged" conclusion.
+5. **PT vs SFT**: pre-train then SFT; never conclude from SFT-only 45M-token runs.
+
+### 3.4 Compute reality
+
+Current 2×7900 XTX: 20M tokens ≈ 3 h per CORE-LR arm, ≈ 5 h per Dense arm; 0.2B ≈ 25–30 h, 1B ≈ 50–60 h,
+10B ≈ 500 h. Therefore:
+
+- Phase 1 uses 20–50M-token pilots to get the shape of the curve;
+- reproducing the paper's 3B→1.5B 10B-token PT needs rented A100/H100 or post-seed compute — never
+  promise 10B on two cards;
+- the seed deck should show the pilot Pareto curve + a rental-compute budget, not a 2-card 10B claim.
+
+```mermaid
+flowchart TB
+    subgraph TODAY["Now: 2 x 7900 XTX"]
+      A1["20M tokens per arm"] --> A2["rank spectrum<br/>pick k grid"]
+      A2 --> A3["k sweep + P6<br/>held-out CE"]
+    end
+    subgraph SEED["Seed: rented 8-GPU node"]
+      B1["0.2-0.5B tokens<br/>multi-seed"] --> B2["PT + 0.6B SFT<br/>Avg9"]
+      B2 --> B3["Falcon / Jais<br/>public benchmark"]
+    end
+    A3 --> B1
+```
+
+## 4. Phase 2 (6–10 weeks): TWYD-MoE
+
+### 4.1 Setting
+
+Start from a **MoE teacher → narrower MoE student** (keep the expert count and router), not dense→MoE:
+
+- OLMoE-1B-7B (64 experts, top-8): runs on one node, complete community eval.
+- Qwen1.5-MoE-A2.7B (60 experts, top-4): strong Chinese/multilingual coverage.
+- Qwen3-30B-A3B: the public benchmark target once compute allows.
+
+### 4.2 Research points
+
+1. **Per-expert reachability**: every expert MLP is `d_ff×r`; measure per-expert eRank, load and
+   complement energy to test whether long-tail experts have more or less stranded capacity.
+2. **Router-aware CORE-LR**: `k_e ∝ load_e` or `∝ gradient_e` under a fixed total complement budget;
+   compare with uniform `k`.
+3. **Shared experts first**: always-active shared experts get the complement first; routed experts are
+   allocated by load.
+4. **Mergeable**: fold `U⊥ Z⊥^T` into each expert's `d_ff×r` weight; inference FLOPs, memory and
+   routing unchanged.
+5. **Router distillation**: the student router input width changes, so it needs a projection `P`;
+   distill the teacher's top-k routing distribution with KL + a load-balance regularizer.
+6. **Basis sharing**: storing `U⊥` per expert costs `L×E×d_ff×(d_ff−H)`; study cross-expert subspace
+   overlap and share bases per expert cluster with per-expert coefficients.
+
+### 4.3 Acceptance
+
+- At equal parameter budget, the MoE student's Avg9 / perplexity / expert load does not degrade.
+- Training memory/time acceptable for at least a 1B-class MoE pilot.
+- Post-merge inference throughput matches the original width-`r` MoE.
+- A "trainable coordinates per expert vs gain" curve, as the second commercial proof point.
+
+## 5. Phase 3: productization, open source, fundraising
+
+- **License**: enterprise plug-in + rank allocator + MoE module; compression services; subscription
+  support; joint development with cloud/model vendors. Charge for delivered quality, cost saved and
+  deployment value — never per training token.
+- **Open source**: ms-swift plug-in, CORE-LR implementation, eval/reproduction scripts, pilot weights
+  where licenses allow. Keep the data pipeline, MoE scheduling/rank allocation, eval harness and
+  domain adaptation proprietary.
+- **Narrative**: not "another LoRA"; rather "provable reachability + zero inference overhead +
+  mergeable compression tooling".
+- **Milestones**: M0 gate + pilot (1–2 months) → M1 CORE-LR Pareto (2–3 months) → M2 MoE pilot
+  (4–6 months) → funding / customer POC.
+
+## 6. This week
+
+1. Finish the two 20M-token arms on FineWeb-Edu score≥4 and record held-out CE/token_acc.
+2. Run `measure_complement_rank` on the trained full-MLP checkpoint; pick the k grid from the spectrum,
+   not from intuition.
+3. Add a factorized forward to `CoreLinear` so the full-CORE arm stops costing 4.4× dense.
+4. Wire `TWYD_LORA_LR` into a real optimizer param group (or delete the knob).
+5. Write a two-page technical memo: problem, method, Pareto curve, reproduction commands, known limits.
+
+## 7. Company plan (wedge = CORE-LR, expansion = TWYD-MoE)
+
+> Technology is the wedge, not the company. The company sells **the same task quality at lower
+> training and deployment cost**, not "a rank formula".
+
+### 7.1 One sentence
+
+> **OmniReach AI lets enterprises compress Qwen/Llama-class models into deployable small models with
+> fewer training coordinates and less memory; training only touches the stranded complement, and
+> inference has zero overhead — extensible to MoE.**
+
+### 7.2 Customers and wedge
+
+1. **Private/industry model teams** with a Qwen/Llama teacher and a 1.5B–2B deployment target.
+2. **Sovereign clouds and model providers** compressing many models per year (license).
+3. **Edge/mobility OEMs** (robotics, vehicles, inspection) with hard latency/memory limits.
+4. **MoE teams** with an existing MoE teacher who want to use expert-level stranded capacity.
+
+First wedge: one industry + one teacher + one 1.5B–2B student + one eval suite.
+
+### 7.3 Product shape
+
+- **Open core**: ms-swift plug-in, CORE-LR, merge/eval/reproduction scripts (Apache-2.0 planned).
+- **Commercial layer**: rank allocator (per layer / projection / expert); factorized CORE execution;
+  MoE router-aware allocation; domain data/calibration/eval pipeline; enterprise support.
+
+### 7.4 Proof points required
+
+1. **Qwen2.5 3B→1.7B (r=1200)**: full CORE 10B PT 63.44 / PT+SFT 63.82; CORE-LR(k≤256) within 0.5;
+   coordinates ≤25% of full CORE; step time or optimizer memory clearly lower.
+2. **Llama 3.2 3B→1.5B (r=1536)**: CORE-LR matches Dense/full CORE with fewer coordinates, proving the
+   method is not Qwen-specific.
+3. **Deployment**: merged model is a plain dense width-`r` model; zero inference-framework changes;
+   measured prefill/decode latency, memory and throughput.
+4. **MoE pilot**: per-expert rank beats uniform rank at equal total budget; routing/output match after
+   merge.
+
+### 7.5 Business model
+
+- License (enterprise plug-in + allocator + MoE module).
+- Compression service (per model/project, including eval and deployment validation).
+- Subscription/support (model upgrades, data/eval pipeline, private deployment).
+- Joint development with cloud/model vendors and industry ISVs.
+
+### 7.6 Milestones
+
+| Horizon | Evidence |
+|---|---|
+| 0–90 days (pre-seed) | G0 official LRC base passes; G1 full CORE reproduces CORE>Dense on the proxy; G2 CORE-LR(k≤256) approaches full CORE; G3 factorized execution cuts step time/optimizer memory; 2 design partners |
+| 3–6 months (seed) | 0.2–0.5B-token scale-up on Qwen/Llama; one customer POC (same quality, lower training cost, zero deployment overhead); MoE pilot; external users/issues/PRs |
+| 6–12 months (A round) | 2–3 paying customers/LOIs; MoE compression recipe; model zoo (Qwen/Llama/domain); reproducible tokens-to-target and $/quality evidence |
+
+## 8. Risks and Go/No-Go
+
+| Risk | Trigger | Response |
+|---|---|---|
+| The low-rank hypothesis fails | `k` must be 1024–2048 to approach full CORE | ship full CORE / a structured low-rank variant instead; keep the service business |
+| The Qwen teacher gap is misread | anyone reads 63.8 as "should be 69.1" | always quote "vs full CORE / 20B LRC", never vs teacher |
+| Attention/embedding is the real bottleneck | per-layer cosine collapses early, complement never engages | attention zoom / LRC co-training / revisit capacity |
+| Two cards are not enough | 10B tokens is infeasible locally | proxy models + paper checkpoints + rented compute |
+| Data/IP provenance | corpus or weights of unclear origin | permissive data only, license audit, clean-room implementation |
+| MoE distracts the main line | MoE starts before G2 | freeze MoE until G2/G3 pass |
+
+| Gate | Criterion | Status |
+|---|---|---|
+| G0 init | CE ≤ 6.0, token acc ≥ 0.2 and ≥ 0.5× teacher, agreement ≥ 0.3 | **PASS** (3B → LRC-1.5B, k=128) |
+| G1 full CORE | Qwen: CORE > Dense; Llama: CORE ≈ Dense | pending full-CORE arm |
+| G2 low rank | k ≤ 256, within 0.5 Avg9 of full CORE, coordinates ≤ 25% | running (k=128 at 10.8% coordinates) |
+| G3 cost | step time ≤ 0.9× dense or optimizer state ≤ 70% | factorized 1.21× layer cost; optimizer state 6.9% of dense |
+| G4 MoE | only after G2/G3 | frozen |
+
+### What we deliberately do not do
+
+- build "yet another LoRA";
+- promise Qwen teacher parity;
+- equate "fewer parameters" with "faster inference";
+- scale to MoE before dense CORE-LR is proven;
+- promise 10B-token runs on two consumer cards.
+
+## 9. Figures and references
+
+| Figure | Source |
+|---|---|
+| Reachability gap (deployed matrix vs trainable slice) | [`figures/reachability_gap.tex`](figures/reachability_gap.tex) |
+| CORE-LR pipeline (SVD → column + complement → merge → deploy) | [`figures/core_lr_pipeline.tex`](figures/core_lr_pipeline.tex) |
+
+Both compile standalone with `pdflatex` and only need TikZ libraries
+`arrows.meta,patterns,positioning,calc,fit,backgrounds`.
+
+**References**
+
+1. Hao et al. *Low-Rank Clone* (LRC). NeurIPS 2025.
+2. Chen, Mao, Li, Zhou, Wang. *Train What You Deploy: Closing the MLP Reachability Gap in Low-Rank
+   Clone Distillation.* arXiv:2609.02006, 2026.
+3. ms-swift — ModelScope training framework (Apache-2.0).
+4. FineWeb-Edu — educational-quality web text with an `int_score` field.
+5. LM Evaluation Harness — 0-shot 9-task protocol used for Avg9.
+
+
+
+

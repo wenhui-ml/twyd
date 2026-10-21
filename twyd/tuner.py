@@ -48,21 +48,38 @@ class CoreLinear(nn.Module):
 class CoreLinearLoRA(nn.Module):
     """Low-rank CORE-LRC: Z_col full (+frozen), Z_perp = A_perp B_perp^T.
 
-    Prop.1 preserved: A_perp/B_perp zero-init => exactly plain-LRC at step 0.
+    Prop.1 preserved: A random / B zero-init => exactly plain-LRC at step 0.
     merged_weight() folds both paths into one deployed matrix (zero latency).
 
     left  (gate/up): W = T Z_col^T  + U_perp (A B^T)^T,  W: d_ff x r
     right (down):    W = Z_col R    + (A B^T) V_perp,    W: r x d_ff
+
+    ``factorized=True`` (only with ``freeze_col=True``) caches the frozen
+    plain-LRC matrix ``W_col`` and evaluates the low-rank delta directly:
+
+        y = F.linear(x, W_col)
+          + ((x @ A) @ (B.T @ basis_perp.T)) * scaling      # gate/up
+          + ((x @ (basis_perp.T @ B)) @ A.T) * scaling      # down
+
+    This avoids rebuilding the full d_ff x r merged matrix every forward, so
+    the rank-k update can actually reduce training compute.  The cache must be
+    refreshed after any external write to ``z_col`` (set_deployed_weight /
+    resume); ``refresh_cache()`` does that.
     """
 
     def __init__(self, T_or_R: torch.Tensor, Z_col: torch.Tensor,
                  U_perp_or_V: torch.Tensor,
                  lora_rank: int = 128, lora_alpha: float = 16.0,
-                 side: str = "left", freeze_col: bool = False):
+                 side: str = "left", freeze_col: bool = False,
+                 factorized: bool = False):
         super().__init__()
         self.side = side
         self.lora_rank = int(lora_rank)
         self.freeze_col = bool(freeze_col)
+        self.factorized = bool(factorized)
+        if self.factorized and not self.freeze_col:
+            raise ValueError("factorized CORE-LR requires freeze_col=True; "
+                             "otherwise the cached W_col goes stale")
         self.with_perp = True
         self.scaling = (float(lora_alpha) / float(lora_rank)) if lora_rank > 0 else 1.0
         self.register_buffer("basis_col", T_or_R.detach().contiguous())
@@ -72,21 +89,110 @@ class CoreLinearLoRA(nn.Module):
         k = self.lora_rank
         if side == "left":
             r, dp = Z_col.shape[0], U_perp_or_V.shape[1]
-            self.lora_A = nn.Parameter(torch.zeros(r, k))
-            self.lora_B = nn.Parameter(torch.zeros(dp, k))
         else:
             r, dp = Z_col.shape[0], U_perp_or_V.shape[0]
-            self.lora_A = nn.Parameter(torch.zeros(r, k))
-            self.lora_B = nn.Parameter(torch.zeros(dp, k))
+        # Standard LoRA init: A random, B zero.  Both-zero would make
+        # dL/dA = grad @ B and dL/dB = A^T @ grad identically zero, so
+        # CORE-LR would never leave the plain-LRC point.
+        self.lora_A = nn.Parameter(torch.empty(r, k))
+        self.lora_B = nn.Parameter(torch.zeros(dp, k))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        if self.factorized:
+            with torch.no_grad():
+                W = (self.basis_col @ self.z_col.T if side == "left"
+                     else self.z_col @ self.basis_col)
+            self.register_buffer("W_col_cache", W.detach().contiguous(),
+                                 persistent=False)
+
+    @torch.no_grad()
+    def refresh_cache(self) -> None:
+        """Rebuild the frozen W_col cache after z_col was externally updated."""
+        if not self.factorized:
+            return
+        bc = self._basis_col_on(self.z_col.device)
+        W = (bc @ self.z_col.T if self.side == "left"
+             else self.z_col @ bc)
+        self.W_col_cache.copy_(W.to(device=self.W_col_cache.device,
+                                    dtype=self.W_col_cache.dtype))
+
+    def _basis_col_on(self, device):
+        """basis_col, materialised on ``device`` on demand.
+
+        With ``factorized=True`` the frozen plain path is already folded into
+        ``W_col_cache``, so ``basis_col`` (d_ff x H, ~50 MB per projection,
+        ~4.2 GB over 84 projections) is only needed by ``merged_weight()``
+        (export) and ``refresh_cache()``.  ``forward`` parks it on CPU to give
+        that VRAM back to activations.
+        """
+        bc = self.basis_col
+        return bc if bc.device == device else bc.to(device)
 
     def merged_weight(self) -> torch.Tensor:
         Zp = (self.lora_A @ self.lora_B.T) * self.scaling  # r x (d_ff-H), zero at init
+        bc = self._basis_col_on(self.z_col.device)
+        bperp = self._basis_perp_on(self.z_col.device)
         if self.side == "left":
-            return self.basis_col @ self.z_col.T + self.basis_perp @ Zp.T
-        return self.z_col @ self.basis_col + Zp @ self.basis_perp
+            return bc @ self.z_col.T + bperp @ Zp.T
+        return self.z_col @ bc + Zp @ bperp
+
+    def _basis_perp_on(self, device):
+        bp = self.basis_perp
+        return bp if bp.device == device else bp.to(device)
+
+    def _maybe_offload_basis_col(self) -> None:
+        """Park the export-only basis_col on CPU (factorized+frozen only)."""
+        if not (self.factorized and self.freeze_col):
+            return
+        bc = self.basis_col
+        if bc.device.type != "cpu":
+            self.basis_col = bc.detach().to("cpu")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.factorized:
+            self._maybe_offload_basis_col()
+            base = nn.functional.linear(x, self.W_col_cache)
+            if self.side == "left":
+                # y_delta = x @ A @ B.T @ U.T
+                delta = (x @ self.lora_A) @ (self.lora_B.T @ self.basis_perp.T)
+            else:
+                # y_delta = x @ V.T @ B @ A.T
+                delta = (x @ (self.basis_perp.T @ self.lora_B)) @ self.lora_A.T
+            return base + delta * self.scaling
         return nn.functional.linear(x, self.merged_weight())
+
+
+def _completion_basis(basis_col: torch.Tensor, basis_perp: torch.Tensor,
+                      side: str, mode: str = "teacher",
+                      seed_key: str = "") -> torch.Tensor:
+    """Pick the direction set the "complement" path writes into.
+
+    mode="teacher" (CORE/CORE-LR): the true structural complement
+    ``U_perp`` / ``V_perp`` read off the teacher SVD.
+
+    mode="col" (P6 equal-parameter reachable-set control, paper §6.1): map the
+    complement coordinates back *inside* the teacher slice,
+    ``T @ A`` (left) / ``A^T @ R`` (right) with ``A`` a fixed random
+    ``H x (d_ff-H)`` matrix (scaled Gaussian).  The trainable-coordinate count
+    is identical to CORE-LR/CORE, but the reachable set stays inside col(T),
+    so no new directions are opened.  Any gain over plain LRC is then
+    attributable to parameters, not to the reachable set.
+
+    ``A`` cannot be orthonormal here for wide MLPs (d_ff-H > H), which is fine:
+    the control only needs a fixed, full-rank map into col(T).
+    """
+    if str(mode or "teacher").lower() != "col":
+        return basis_perp
+    import math as _math
+    import zlib
+
+    H = basis_col.shape[1] if side == "left" else basis_col.shape[0]
+    dp = basis_perp.shape[1] if side == "left" else basis_perp.shape[0]
+    seed = zlib.crc32(f"{seed_key}:{side}:{H}:{dp}".encode()) & 0xFFFFFFFF
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    A = torch.randn(H, dp, generator=g, dtype=torch.float32) / _math.sqrt(H)
+    T = basis_col.detach().to(device="cpu", dtype=torch.float32)
+    B = (T @ A) if side == "left" else (A.T @ T)
+    return B.to(dtype=basis_col.dtype).contiguous()
 
 
 class DenseLinearLoRA(nn.Module):
@@ -181,8 +287,56 @@ class _TwydWrapper(nn.Module):
         for p in self.teacher.parameters():
             p.requires_grad_(False)
         self.teacher.eval()
+        # (device -> (params, buffers)) cache; see _teacher_dev_params.
+        self._teacher_dev_cache = {}
         self.twyd_cfg = cfg
         self.config = getattr(student, "config", None)
+
+    def _teacher_dev_params(self, device, _fcall, teacher=None):
+        """Device-resident teacher weights, materialised at most once.
+
+        The teacher is loaded on CPU on purpose (keeps VRAM for the student),
+        so its weights have to reach the compute device before each forward.
+        Doing that with a fresh ``{k: v.to(device)}`` dict per call re-uploads
+        the full 3.2B-param teacher (6.4 GB bf16) every single training step:
+        measured 1.4-1.9 s/step on a 7900 XTX, i.e. the GPU was idle >90% of
+        every step waiting on PCIe.  Cache the moved tensors instead.
+
+        ``TWYD_TEACHER_DEVICE=cpu`` disables the GPU copy (useful when the
+        teacher genuinely does not fit alongside the student); the first
+        attempt also falls back to the old per-call behaviour on OOM.
+        """
+        t = teacher if teacher is not None else self.teacher
+        key = (str(device), _fcall is not None)
+        hit = self._teacher_dev_cache.get(key)
+        if hit is not None:
+            return hit
+        mode = (os.environ.get("TWYD_TEACHER_DEVICE", "auto") or "auto").lower()
+        if mode == "cpu" or _fcall is None:
+            return ({k: v.to(device) for k, v in t.named_parameters()},
+                    {k: v.to(device) for k, v in t.named_buffers()})
+        try:
+            sdt = next(self.student.parameters()).dtype
+        except Exception:
+            sdt = None
+        try:
+            params = {}
+            for k, v in t.named_parameters():
+                params[k] = v.to(device=device, dtype=sdt) if (
+                    sdt is not None and v.is_floating_point()) else v.to(device)
+            buffers = {k: v.to(device) for k, v in t.named_buffers()}
+        except Exception as e:  # OOM or unsupported device
+            print(f"[twyd] teacher->{device} failed ({type(e).__name__}: {e}); "
+                  "falling back to a per-step host->device copy. Set "
+                  "TWYD_TEACHER_DEVICE=cpu to silence this.", flush=True)
+            self._teacher_dev_cache[key] = None
+            return ({k: v.to(device) for k, v in t.named_parameters()},
+                    {k: v.to(device) for k, v in t.named_buffers()})
+        nbytes = sum(v.numel() * v.element_size() for v in params.values())
+        print(f"[twyd] teacher pinned on {device} ({nbytes / 2**30:.2f} GiB, "
+              "moved once)", flush=True)
+        self._teacher_dev_cache[key] = (params, buffers)
+        return params, buffers
 
     def state_dict(self, *args, **kwargs):
         sd = self.student.state_dict(*args, **kwargs)
@@ -343,16 +497,15 @@ class _TwydWrapper(nn.Module):
             if isinstance(ids, torch.Tensor):
                 tdev = next(t.parameters()).device
                 if tdev != ids.device and _fcall is not None:
-                    tparams = {k: v.to(ids.device) for k, v in t.named_parameters()}
-                    tbuffers = {k: v.to(ids.device) for k, v in t.named_buffers()}
+                    # CRITICAL: move the teacher ONCE, not once per step.  The
+                    # naive version rebuilt {name: v.to(device)} on every call,
+                    # i.e. pushed the whole 3.2B-param teacher (6.4 GB bf16)
+                    # across PCIe for every training step.  Measured on this
+                    # box that alone was ~1.4-1.9 s/step (>90% of step time)
+                    # while the GPU sat idle waiting for the copy.
+                    tparams, tbuffers = self._teacher_dev_params(ids.device, _fcall, t)
                     inputs = {k: (v.to(ids.device) if isinstance(v, torch.Tensor) else v)
                               for k, v in inputs.items()}
-                    try:
-                        sdt = next(self.student.parameters()).dtype
-                        tparams = {k: (v.to(sdt) if v.is_floating_point() else v)
-                                   for k, v in tparams.items()}
-                    except Exception:
-                        pass
                     with torch.no_grad():
                         return _fcall(t, (tparams, tbuffers), tuple(), inputs)
                 if tdev != ids.device and _fcall is None:
@@ -480,6 +633,13 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
     lora_rank = int(getattr(cfg, "lora_rank", 0) or 0)
     lora_alpha = float(getattr(cfg, "lora_alpha", 16.0) or 16.0)
     lora_mode = str(getattr(cfg, "lora_mode", "dense") or "dense")
+    factorized = bool(getattr(cfg, "factorized", False))
+    perp_basis = str(getattr(cfg, "perp_basis", "teacher") or "teacher").lower()
+    try:
+        from .config import parse_rank_map as _parse_rank_map, module_rank as _module_rank
+        rank_map = _parse_rank_map(getattr(cfg, "rank_map", "") or "", default=lora_rank)
+    except Exception:
+        _module_rank, rank_map = (lambda _rm, _n, _d=0: int(_d)), {}
     lora_layers_spec = str(getattr(cfg, "lora_layers", "") or "")
     try:
         from .config import parse_layer_range as _parse_lr
@@ -523,7 +683,9 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                 except Exception:
                     _li = None
                 in_lora_set = (not lora_layer_active) or (_li is None) or (_li in lora_layer_set)
-                use_lora_here = (lora_rank > 0) and in_lora_set
+                rank_here = int(_module_rank(rank_map, mod_name, lora_rank))
+                rank_here = max(0, min(rank_here, r, d_ff - H))
+                use_lora_here = (rank_here > 0) and in_lora_set
                 if is_dense:
                     # Dense-LRC deploys W directly. When the student base is the
                     # teacher slice (the normal path) the slice *is* the merged
@@ -539,7 +701,7 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                         Z_col = (T.T @ s_w).T.contiguous()
                         W0 = (T @ Z_col.T).contiguous()
                     if use_lora_here:
-                        new_mod = DenseLinearLoRA(r, d_ff, lora_rank=lora_rank,
+                        new_mod = DenseLinearLoRA(r, d_ff, lora_rank=rank_here,
                                                    lora_alpha=lora_alpha,
                                                    base_weight=W0)
                     else:
@@ -548,6 +710,7 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                             new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
                     T, P = build_core_basis(t_weight, "left")
+                    P = _completion_basis(T, P, "left", perp_basis, mod_name)
                     Z_col = (T.T @ s_w).T.contiguous()
                     W0 = (T @ Z_col.T).contiguous()  # merged plain weight d_ff x r
                     Z_perp_init = None
@@ -558,15 +721,16 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                         # Direction 1 (Fig.8b): deep layers frozen plain, zero trainable.
                         new_mod = CoreLinear(T, Z_col, None, None, side="left", with_perp=False)
                     elif use_core_lora:
-                        new_mod = CoreLinearLoRA(T, Z_col, P, lora_rank=lora_rank,
+                        new_mod = CoreLinearLoRA(T, Z_col, P, lora_rank=rank_here,
                                                  lora_alpha=lora_alpha, side="left",
-                                                 freeze_col=bool(getattr(cfg, "freeze_col", False)))
+                                                 freeze_col=bool(getattr(cfg, "freeze_col", False)),
+                                                 factorized=factorized)
                         if Z_perp_init is not None:
                             from .init import set_deployed_weight
                             set_deployed_weight(new_mod, s_w, t_weight, side="left",
-                                                perp=ridge_perp, lora_rank=lora_rank)
+                                                perp=ridge_perp, lora_rank=rank_here)
                     elif use_lora_here and lora_mode == "dense":
-                        new_mod = DenseLinearLoRA(r, d_ff, lora_rank=lora_rank,
+                        new_mod = DenseLinearLoRA(r, d_ff, lora_rank=rank_here,
                                                    lora_alpha=lora_alpha,
                                                    base_weight=(s_w if Z_perp_init is not None else W0))
                     else:
@@ -587,7 +751,9 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                 except Exception:
                     _li = None
                 in_lora_set = (not lora_layer_active) or (_li is None) or (_li in lora_layer_set)
-                use_lora_here = (lora_rank > 0) and in_lora_set
+                rank_here = int(_module_rank(rank_map, mod_name, lora_rank))
+                rank_here = max(0, min(rank_here, r, d_ff - H))
+                use_lora_here = (rank_here > 0) and in_lora_set
                 if is_dense:
                     t_slice = t_weight[:r, :].to(torch.float32)
                     if preserve_w or (s_w.shape == t_slice.shape and torch.allclose(s_w, t_slice, atol=1e-6)):
@@ -598,7 +764,7 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                         Z_col = (s_w @ R.T).contiguous()
                         W0 = (Z_col @ R).contiguous()
                     if use_lora_here:
-                        new_mod = DenseLinearLoRA(d_ff, r, lora_rank=lora_rank,
+                        new_mod = DenseLinearLoRA(d_ff, r, lora_rank=rank_here,
                                                    lora_alpha=lora_alpha,
                                                    base_weight=W0)
                     else:
@@ -607,6 +773,7 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                             new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
                     R, Vp = build_core_basis(t_weight, "right")
+                    Vp = _completion_basis(R, Vp, "right", perp_basis, mod_name)
                     Z_col = (s_w @ R.T).contiguous()
                     W0 = (Z_col @ R).contiguous()  # merged plain weight r x d_ff
                     Z_perp_init = None
@@ -617,15 +784,16 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                         # Direction 1 (Fig.8b): deep layers frozen plain, zero trainable.
                         new_mod = CoreLinear(R, Z_col, None, None, side="right", with_perp=False)
                     elif use_core_lora:
-                        new_mod = CoreLinearLoRA(R, Z_col, Vp, lora_rank=lora_rank,
+                        new_mod = CoreLinearLoRA(R, Z_col, Vp, lora_rank=rank_here,
                                                  lora_alpha=lora_alpha, side="right",
-                                                 freeze_col=bool(getattr(cfg, "freeze_col", False)))
+                                                 freeze_col=bool(getattr(cfg, "freeze_col", False)),
+                                                 factorized=factorized)
                         if Z_perp_init is not None:
                             from .init import set_deployed_weight
                             set_deployed_weight(new_mod, s_w, t_weight, side="right",
-                                                perp=ridge_perp, lora_rank=lora_rank)
+                                                perp=ridge_perp, lora_rank=rank_here)
                     elif use_lora_here and lora_mode == "dense":
-                        new_mod = DenseLinearLoRA(d_ff, r, lora_rank=lora_rank,
+                        new_mod = DenseLinearLoRA(d_ff, r, lora_rank=rank_here,
                                                    lora_alpha=lora_alpha,
                                                    base_weight=(s_w if Z_perp_init is not None else W0))
                     else:
@@ -638,8 +806,8 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
         setattr(parent, attr, new_mod.to(device=lin_dev, dtype=lin_dt))
         meta[mod_name] = {"side": side, "d_ff": d_ff, "H": H, "r": r,
                           "with_perp": with_perp, "is_dense": is_dense,
-                          "branch": cfg.branch, "lora_rank": lora_rank,
-                          "lora_alpha": lora_alpha}
+                          "branch": cfg.branch, "lora_rank": rank_here,
+                          "lora_alpha": lora_alpha, "factorized": factorized}
     return meta
 
 
@@ -708,6 +876,11 @@ def _merge_state_dict_(model, state_dict) -> None:
                             own[key].copy_(v.to(own[key].device, own[key].dtype))
                 except Exception:
                     continue
+        # CoreLinearLoRA(factorized) caches W_col; refresh after resume/state load.
+        for mod in student.modules():
+            refresh = getattr(mod, "refresh_cache", None)
+            if callable(refresh):
+                refresh()
     except Exception:
         pass
 
@@ -780,16 +953,17 @@ def _hidden_of(mod: nn.Module) -> int:
 def _student_head_layout(tc, r: int):
     """Return (heads, kv, head_dim, new_heads, new_kv, kv_map) for width r.
 
-    LRC keeps the teacher's GQA grouping. A naive "largest divisor of new_heads"
-    choice changes the q/kv ratio (e.g. 24q/8kv -> 8q/8kv or 12q/6kv) and makes
-    every q head read the wrong kv head. Two cases:
+    Official LRC keeps the teacher's attention shape and only compresses the
+    residual stream.  Verified from the released configs:
 
-    * new_heads * kv is divisible by heads: ratio preserved exactly; student kv
-      head i is teacher kv head i (r=1536: 12q/4kv -> kv_map [0,1,2,3]).
-    * not divisible (r=1024: 8q cannot split into groups of 3): keep
-      new_kv = new_heads (ratio 1) and duplicate/select the teacher kv head each
-      q head actually used: kv_map[i] = floor(i * kv / heads)
-      (r=1024 -> [0,0,0,1,1,1,2,2]).
+      LRC-1.5B-Base (Llama-3.2-3B teacher): hidden 1536, 24 heads / 8 kv,
+        head_dim 128  ->  q_proj (3072, 1536), o_proj (1536, 3072)
+      LRC-1.7B-Base (Qwen2.5-3B teacher):  hidden 1200, 16 heads / 2 kv,
+        head_dim 128  ->  q_proj (2048, 1200), o_proj (1200, 2048)
+
+    So attention width stays at the teacher's H (= heads * head_dim); the head
+    count is NOT reduced.  Reducing heads (the earlier 24->12 / 32->8 choice)
+    is not what LRC does and makes the slice warm start semantically wrong.
     """
     H = int(getattr(tc, "hidden_size", 0) or 0)
     heads = int(getattr(tc, "num_attention_heads", 0) or 0)
@@ -797,21 +971,10 @@ def _student_head_layout(tc, r: int):
     head_dim = int(getattr(tc, "head_dim", None) or ((H // heads) if heads else 0))
     if H <= 0 or heads <= 0 or head_dim <= 0:
         raise ValueError(f"[twyd] bad teacher attention config: H={H}, heads={heads}, head_dim={head_dim}")
-    if r % head_dim != 0:
-        raise ValueError(
-            f"[twyd] student_hidden r={r} not divisible by teacher head_dim={head_dim}; "
-            "pick TWYD_R that is a multiple of the teacher head_dim")
-    new_heads = r // head_dim
-    if new_heads <= 0 or new_heads > heads:
-        raise ValueError(
-            f"[twyd] r={r} gives new_heads={new_heads}, outside (0, teacher heads={heads}]")
-    if (new_heads * kv) % heads == 0:
-        new_kv = new_heads * kv // heads
-        kv_map = list(range(new_kv))
-    else:
-        new_kv = new_heads
-        kv_map = [min(kv - 1, (i * kv) // heads) for i in range(new_kv)]
-    assert new_heads % new_kv == 0, (new_heads, new_kv)
+    if r <= 0:
+        raise ValueError(f"[twyd] student_hidden must be > 0, got {r}")
+    new_heads, new_kv = heads, kv
+    kv_map = list(range(kv))
     return heads, kv, head_dim, new_heads, new_kv, kv_map
 
 
@@ -956,6 +1119,9 @@ def _twyd_kw(args) -> dict:
         "lora_layers": _os.environ.get("TWYD_LORA_LAYERS", None),
         "lora_lr": _os.environ.get("TWYD_LORA_LR", None),
         "freeze_col": _os.environ.get("TWYD_FREEZE_COL", None),
+        "rank_map": _os.environ.get("TWYD_RANK_MAP", None),
+        "factorized": _os.environ.get("TWYD_FACTORIZED", None),
+        "perp_basis": _os.environ.get("TWYD_PERP_BASIS", None),
     }
     for k, v in env_map.items():
         if v is None or (isinstance(v, str) and v == ""):
@@ -990,6 +1156,8 @@ def _twyd_kw(args) -> dict:
         kw["calib_joint"] = kw["calib_joint"].strip().lower() not in ("0", "false", "no", "off")
     if "freeze_col" in kw and isinstance(kw["freeze_col"], str):
         kw["freeze_col"] = kw["freeze_col"].strip().lower() not in ("0", "false", "no", "off")
+    if "factorized" in kw and isinstance(kw["factorized"], str):
+        kw["factorized"] = kw["factorized"].strip().lower() not in ("0", "false", "no", "off")
     if "target_modules" in kw and isinstance(kw["target_modules"], str):
         _tm_raw = kw["target_modules"].strip()
         # Accept both comma-separated (gate_proj,up_proj) and JSON-like
@@ -1041,7 +1209,10 @@ def _prepare_model_impl(args, model, branch: str):
               lora_mode=str(kw.get("lora_mode", "dense")).lower(),
               lora_layers=str(kw.get("lora_layers", "") or ""),
               lora_lr=kw.get("lora_lr", None),
-              freeze_col=bool(kw.get("freeze_col", False)))
+              freeze_col=bool(kw.get("freeze_col", False)),
+              rank_map=str(kw.get("rank_map", "") or ""),
+              factorized=bool(kw.get("factorized", False)),
+              perp_basis=str(kw.get("perp_basis", "teacher") or "teacher").lower())
     cfg.validate()
     teacher_id = cfg.teacher_model or getattr(args, "model", None)
     if teacher_id is None:

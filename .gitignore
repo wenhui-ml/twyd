@@ -6,3 +6,8 @@ _upstream/ms-swift/ms_swift.egg-info/
 data/
 output/
 twyd.egg-info/
+# LaTeX build artifacts from docs/figures
+*.aux
+*.synctex.gz
+*.fls
+*.fdb_latexmk

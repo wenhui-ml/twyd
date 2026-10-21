@@ -184,37 +184,20 @@ def _module_opt(model: nn.Module, name: str):
 
 def head_projection_mats(tcfg, r: int, P: torch.Tensor,
                          head_mode: str = "select"):
-    """Build S_q (r x H) and S_kv (new_kv*d x kv*d) for width-r attention.
+    """Build S_q and S_kv for the LRC attention layout.
 
-    select: keep the first new_heads teacher q heads / kv_map teacher kv heads.
-    merge:  average groups of teacher heads (requires exact divisibility).
+    LRC keeps the teacher's heads (verified against LRC-1.5B/1.7B-Base), so
+    q/k/v output width is the teacher's H and no head selection is needed:
+        S_q  = I_H              (H x H)
+        S_kv = I_{kv*head_dim}  (kv*d x kv*d)
+    ``r`` only affects the residual-stream projection ``P`` (r x H), which is
+    applied on the input side of q/k/v and the output side of o_proj.
     """
     from .tuner import _student_head_layout
     H = int(P.shape[1])
     heads, kv, head_dim, new_heads, new_kv, kv_map = _student_head_layout(tcfg, r)
-    if new_heads * head_dim != r:
-        raise ValueError(f"new_heads*head_dim={new_heads * head_dim} != r={r}")
-    eye_d = torch.eye(head_dim)
-    S_q = torch.zeros(r, H)
-    gq = heads // new_heads if new_heads and heads % new_heads == 0 else 0
-    if head_mode == "merge" and gq > 1:
-        for i in range(new_heads):
-            for j in range(gq):
-                S_q[i * head_dim:(i + 1) * head_dim,
-                    (i * gq + j) * head_dim:(i * gq + j + 1) * head_dim] = eye_d / gq
-    else:
-        for i in range(new_heads):
-            S_q[i * head_dim:(i + 1) * head_dim, i * head_dim:(i + 1) * head_dim] = eye_d
-    S_kv = torch.zeros(new_kv * head_dim, kv * head_dim)
-    gk = kv // new_kv if new_kv and kv % new_kv == 0 else 0
-    if head_mode == "merge" and gk > 1:
-        for j in range(new_kv):
-            for t in range(gk):
-                S_kv[j * head_dim:(j + 1) * head_dim,
-                     (j * gk + t) * head_dim:(j * gk + t + 1) * head_dim] = eye_d / gk
-    else:
-        for j, src in enumerate(kv_map):
-            S_kv[j * head_dim:(j + 1) * head_dim, src * head_dim:(src + 1) * head_dim] = eye_d
+    S_q = torch.eye(heads * head_dim, H)
+    S_kv = torch.eye(kv * head_dim, kv * head_dim)
     return S_q.contiguous(), S_kv.contiguous()
 
 
@@ -495,6 +478,9 @@ def set_deployed_weight(m: nn.Module, W: torch.Tensor, teacher_weight: torch.Ten
     with torch.no_grad():
         m.z_col.copy_(Z_col.to(device=m.z_col.device, dtype=m.z_col.dtype))
     out["z_col_norm"] = float(Z_col.norm())
+    refresh = getattr(m, "refresh_cache", None)
+    if callable(refresh):
+        refresh()
     if perp == "zero":
         Z_perp = torch.zeros_like(Z_perp)
     out["z_perp_norm"] = float(Z_perp.norm())

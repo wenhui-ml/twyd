@@ -1,390 +1,350 @@
-# twyd
-Train What You Deploy: Closing the MLP Reachability Gap in Low-Rank Clone Distillation
+<div align="center">
 
-`twyd` 在 [ms-swift](https://github.com/modelscope/ms-swift) 之上实现
-[Low-Rank Clone (LRC)](https://github.com/CURRENTF/LowRankClone) 风格的 low-rank clone 蒸馏，
-补上 MLP reachability gap：把训练对象从 teacher slice 换成整个 deployed matrix。
+# OmniReach AI
 
-## 原理（TWYD.pdf §4 / A.5）
+**Half the size. Near-teacher accuracy. Zero inference overhead.**
 
-- Plain-LRC：`W = T Z_col^T`，`T: d_ff×H` 冻结，只训 `Z_col: r×H`；
-  利用率 `u = 1/ρ`，`ρ = d_ff/d_model^(T)`（2.67 / 3.50 / 5.375）。
-- Dense-LRC（§4.1）：直接训整块 `d_ff×r` dense，warm start 在 merged plain-LRC 上；推理零新增。
-- CORE-LRC（§4.2）：`W = T Z_col^T + U⊥ Z⊥^T`，`[T U⊥]` 完备正交，`Z⊥` 零初值；
-  gate/up 左补，down 右补（`Z⊥ V⊥^T`）；merge 后与 Dense 同形同权重（Prop.1）。
-- Loss（Eq.6-7）：`T^2·KL(T=40) + CE + λ_aux·L_align`，`λ_aux=0.2`。
+Model compression for sovereign and edge AI.
 
-## CORE-LR 技术方案（2026-10）
+[![Seed](https://img.shields.io/badge/seed-US%241.5--2.0M-111111?style=flat-square)](#the-ask)
+[![Paper](https://img.shields.io/badge/paper-arXiv%3A2609.02006-1f6feb?style=flat-square)](https://arxiv.org/abs/2609.02006)
+[![Code](https://img.shields.io/badge/code-github.com%2Fwenhui--ml%2Ftwyd-2ea043?style=flat-square)](https://github.com/wenhui-ml/twyd)
 
-> 目标：把论文的 **full CORE** 推进到 **CORE-LR(k)**——用更少的可训坐标逼近
-> full CORE 的质量，并让训练成本真实下降。**不是**用 rank 去追 teacher parity。
+[The problem](#the-problem) · [The insight](#the-insight) · [Evidence](#evidence) · [Product](#product) · [Roadmap](#roadmap) · [Team](#team) · [The ask](#the-ask)
 
-### 1. 目标与边界
+</div>
 
-- **Qwen2.5 是主战场**：`3B→1.7B, r=2048`，`d_ff/H=5.375`，`stranded=81.4%`；
-  宽 MLP 让 full CORE 比 Dense 高约 4 Avg9，是 CORE-LR 最该拿下的 regime。
-- **Llama 3.2 是效率对照**：`3B→1.5B, r=1536`，`d_ff/H=2.67`，`stranded=62.5%`；
-  论文里 Dense/CORE tie，CORE-LR 的目标是“更少坐标打平”，不强求超过 Dense。
-- **teacher parity 不是本项目指标**：Qwen Table 8 的 full CORE 也只有 63.44/63.82，
-  teacher 是 69.11；CORE-LR 的目标是逼近 full CORE，而不是 69.11。
-- **k 只影响训练成本**：部署时 merge 成 width-r dense 权重，推理延迟/显存由
-  width-r student 决定；CORE-LR 不增加推理开销，也不因 k 变小而额外加速推理。
+---
 
-### 2. 论文参考点（Qwen2.5 3B→1.7B，r=2048）
+<table>
+<tr>
+<td align="center" width="33%"><h2>~10B</h2>compression-stage tokens<br/><sub>vs 50–94B for prune-and-retrain, ~9T for the official model</sub></td>
+<td align="center" width="33%"><h2>1/2</h2>the parameters of its 3B teacher,<br/>same 9-task average</td>
+<td align="center" width="33%"><h2>0</h2>extra inference cost<br/><sub>same dense shape, same FLOPs, no custom kernels</sub></td>
+</tr>
+</table>
 
-| 模型 | Avg9 | 说明 |
-|---|---:|---|
-| Teacher Qwen2.5-3B | 69.11 | 上限 |
-| Full CORE 10B PT | 63.44 | CORE 参考 |
-| Full CORE 10B PT+SFT | 63.82 | CORE 参考 |
-| LRC ~20B PT | 63.43 | CORE 在 10B 追平 20B LRC |
-| Dense 10B PT | 59.38 | 同 token 对照 |
-| LRC 10B PT | 52.99 | matched baseline |
+**Founder:** Wenhui Chen · **Contact:** splendon.chen@gmail.com · **Planned incorporation:** ADGM, Abu Dhabi (UAE)
+**Round:** Seed US$1.5–2.0M · 12 months · open to a non-dilutive grant with equivalent sovereign compute
 
-结论：CORE 的承诺是 **2× token efficiency + 相对 matched LRC +10.45**，
-不是 teacher parity。CORE-LR 的成功标准是：
+---
 
-```text
-CORE-LR(k<=256) ≈ Full CORE (63.4/63.8)
-且可训坐标 <= Full CORE 的 25%
-且 step time / optimizer memory 明显下降
+## The 30-second version
+
+Every compression method is judged by the model it ships. But a compressed student is defined by **two**
+shapes that are usually not the same: the weight it **deploys**, and the weight family its training can
+actually **reach**.
+
+State-of-the-art weight-inheritance distillation (Low-Rank Clone, NeurIPS 2025) deploys a full-width
+student MLP while tying training to a teacher-induced slice. The result: **62.5–81.4% of each deployed
+matrix's independent directions are never trained**, yet you pay for all of them at inference.
+
+OmniReach AI ships the fix — **TWYD: train what you deploy**. We open those stranded directions during
+distillation and fold everything back into the *same* dense matrix. No new parameters, no new kernels,
+no runtime changes. Half-size models that keep their teacher's aggregate quality, at a fraction of the
+usual compression budget.
+
+```mermaid
+flowchart LR
+    A["deployed student MLP<br/>d_ff x r"] --> B["what LRC trains<br/>col(T): 18.6-37.5%"]
+    A --> C["never trained<br/>complement: 62.5-81.4%"]
+    C -->|"TWYD opens it"| D["same deployed matrix<br/>now fully reachable"]
+    B --> D
+    D --> E["merge: one dense weight<br/>0 extra params / FLOPs"]
 ```
 
-### 3. 模型对与算力现实
+---
 
-| 用途 | Teacher | Student | r | 说明 |
-|---|---|---|---:|---|
-| Qwen 精确目标 | Qwen2.5-3B | 1.7B | 2048 | 优先用官方 LRC/PT base |
-| Qwen 2 卡代理 | Qwen2.5-1.5B | width-r | 1024 | 保留宽 MLP 几何，适合测谱/rank |
-| Llama 精确目标 | Llama-3.2-3B | 1.5B | 1536 | 需要官方 LRC/PT base |
-| Llama 2 卡代理 | Llama-3.2-1B | width-r | 512 | full CORE 约 150M 可训，适合 pilot |
+## The problem
 
-2×7900 XTX 的现实预算（参考 `docs/ROADMAP.md`）：45M tokens ≈ 2.3h，
-0.2B ≈ 10h，0.5B ≈ 25h，10B ≈ 500h。**不要在 2 卡上硬跑 10B**；用论文
-checkpoint 或租卡做最终放大。
+Sovereign AI must run locally, but the models do not fit.
 
-### 4. 四阶段实验
+| Approach | What it costs | What it leaves on the table |
+|---|---|---|
+| **Retrain a smaller model** | Prune-and-distill recipes consumed **50–94B tokens** (Minitron, Sheared-LLaMA) | A compute bill most organizations cannot justify |
+| **Quantize only** | Calibration, kernel support | Shrinks **bytes**, not the architecture; stacks with us rather than replacing us |
+| **Latest distillation (LRC)** | ~10–20B tokens | **62.5–81.4% of the free directions** in each deployed MLP are never trained — you pay for the full matrix and train a slice of it |
 
-#### Stage 0：gate（0 token）
+Today we serve dense 3–8B models for edge and on-prem. 30B+ Mixture-of-Experts is the funded next step.
 
-```bash
-python scripts/check_init.py \
-  --teacher /path/to/teacher \
-  --model /path/to/student_base \
-  --r 1024 --branch core --seq-len 128
+### Why now
+
+- **Capacity is arriving.** HUMAIN targets 1.9 GW of AI data-center capacity by 2030 and 6.6 GW by 2034,
+  hosting open models in-country for data sovereignty.
+- **Regional models must deploy.** Arabic-first models such as ALLaM 34B, plus Falcon and Jais, have to
+  run on-prem and at the edge.
+- **The category is funded.** Multiverse Computing raised a **$570M Series C at a $1.7B pre-money**
+  valuation (July 2026) and lists the Middle East among its expansion regions.
+
+Demand for smaller deployable models is real, and so is competition. Our wedge: **the lowest cost to
+compress, with zero deployment overhead.**
+
+---
+
+## The insight
+
+A non-square MLP weight splits its output space into the teacher-occupied range and a structural
+complement. LRC writes only into the first one.
+
+$$
+W_s \in \mathbb{R}^{d_{ff}\times r},\qquad
+W_s = \underbrace{T Z_{col}^{\top}}_{\text{trained}},\qquad
+u=\frac{\dim\mathrm{col}(T)}{d_{ff}}=\frac{1}{\rho},\qquad
+\rho=\frac{d_{ff}}{d_{model}}.
+$$
+
+$$
+\text{stranded}=1-\frac{1}{\rho}
+=62.5\%\ \text{(Llama-3.2-3B}\to\text{1.5B)}
+=81.4\%\ \text{(Qwen2.5-3B}\to\text{1.7B)}.
+$$
+
+**Train what you deploy** is the simplest possible intervention: add the complement path,
+zero-initialized, and train the entire deployed matrix from the identical LRC warm start.
+
+$$
+W_s \;=\; T Z_{col}^{\top} \;+\; U_\perp Z_\perp^{\top},
+\qquad [\,T\ U_\perp\,]\ \text{is a complete orthonormal basis of}\ \mathbb{R}^{d_{ff}}.
+$$
+
+Two mergeable realizations — a canonical dense matrix (**Dense-LRC**) and the teacher's own spectral
+basis (**CORE-LRC**) — both merge to the *identical* deployed weight at zero inference cost. The paper's
+controls (dense control, random completion, equal-parameter `col(T)` arm) place the cause on the
+**reachable set**, not on a privileged basis or on parameter count.
+
+```mermaid
+flowchart LR
+    subgraph TRAIN["training only"]
+      W["LRC warm start<br/>W = T Z_col^T"]
+      C["open complement<br/>+ U_perp Z_perp^T<br/>zero-initialized"]
+      W --> C
+    end
+    subgraph EXPORT["export"]
+      M["merge<br/>one d_ff x r matrix"]
+    end
+    subgraph DEPLOY["deployment"]
+      D["vLLM / TensorRT / edge runtime<br/>identical shape, params, FLOPs"]
+    end
+    C --> M --> D
+    M -.->|"training overhead disappears"| D
 ```
 
-必须 `CE <= 6.0`、`mean cos >= 0.5`、`token_acc >= 0.20`。不过 gate 就先换
-官方 LRC base / PT checkpoint；否则 dense/core/CORE-LR 的差异会被坏初始化淹没。
+<p align="center">
+  <img src="docs/figures/reachability_gap.png" alt="The MLP reachability gap: 62.5-81.4% of each deployed matrix is never trained" width="760"/>
+</p>
 
-#### Stage 1：小规模 full CORE，测真实补空间谱
+<p align="center"><sub><b>Figure 1.</b> A deployed <code>d_ff x r</code> student MLP. Plain LRC trains only the teacher range;
+the structural complement is served at inference and never trained. TWYD opens it and merges back to the same matrix.
+Source: <a href="docs/figures/reachability_gap.tex"><code>docs/figures/reachability_gap.tex</code></a>.</sub></p>
 
-在代理模型上跑 20–50M tokens 的 full CORE（`TWYD_LORA_RANK=0`, `branch=core`），
-然后用：
+---
 
-```bash
-python scripts/measure_complement_rank.py \
-  --student output/full-core-pilot \
-  --teacher /path/to/teacher \
-  --layers all --topk 32,64,128,256,512,1024 \
-  --json-out output/rank_spectrum.json
-```
+## Evidence
 
-得到每层/每投影 `Z_perp` 的 top-k energy、eRank、stable rank。这是 rank 的金标准；
-没有 full CORE checkpoint 时，才退回梯度/激活先验。
+Compression-stage tokens and 9-task 0-shot accuracy (Avg9). Higher is better; accuracy axis starts at 50.
 
-#### Stage 2：CORE-LR(k) sweep
-
-同一 base、同一 token 预算：
-
-```text
-k = 64, 128, 256, 512
-```
-
-记录 CE/token_acc、Avg9 子集、可训坐标、optimizer memory、peak memory、
-step time、merge parity。判断 k 是否能在 `<=256` 内逼近 full CORE。
-
-#### Stage 3：rank allocator + factorized forward
-
-- 用 Stage 1 的 `E_{l,p}(k)` 做预算分配：
-
-```text
-maximize  sum E_{l,p}(k_{l,p})
-s.t.      sum k_{l,p}(r + d_ff-H) <= K_total
-```
-
-- 当前只支持全局 `TWYD_LORA_RANK`；下一步加 `TWYD_RANK_MAP`（per-module k）。
-- 实现 cached `W_col` + factorized forward：
-
-```text
-y = F.linear(x, W_col)
-  + ((x @ A) @ (B.T @ basis_perp.T)) * scaling
-```
-
-否则 k 只省参数/优化器，不省主计算，融资故事不完整。
-
-#### Stage 4：放大与 MoE
-
-- 代理模型验证后，在 Qwen2.5-3B→1.7B / Llama-3.2-3B→1.5B 上做 0.2–0.5B token
-  的放大验证；
-- dense CORE-LR 通过 gate 后，再做 MoE：per-expert `k_e`、router-aware allocation、
-  merge parity；
-- 不在 dense 未证明前把 MoE 当主线。
-
-### 5. 代码改造清单
-
-1. **ModelSpec 适配层**：Llama/Qwen 的 target modules、attention bias、tie、
-   GQA/kv_map、vocab、merge/logits parity。
-2. **per-module rank map**：`TWYD_RANK_MAP` + `CoreLinearLoRA` 按模块名取 k。
-3. **rank allocator**：读 `rank_spectrum.json`，贪心/背包分配，输出 rank map。
-4. **factorized forward**：缓存 frozen `W_col`，只对低秩项建 autograd 图。
-5. **eval harness**：CE/token_acc、Avg9 子集、tokens-to-target、peak memory、step time。
-
-### 6. Go / No-Go
-
-| Gate | 标准 |
-|---|---|
-| G0 初始化 | CE <= 6.0, cos >= 0.5 |
-| G1 full CORE | Qwen: CORE > Dense；Llama: CORE ≈ Dense |
-| G2 低秩假设 | k <= 256，与 full CORE 差距 <= 0.5，坐标 <= 25% |
-| G3 成本 | step time 降低 >= 1.3x 或 optimizer memory 降低 >= 30% |
-| G4 MoE | 只有 G2/G3 通过才启动 |
-
-## 结构
-
-```
-twyd/  config.py core_basis.py tuner.py loss.py init.py merge.py plugin.py
-scripts/ train_dense.sh train_core.sh convert_ckpt.py
-tests/ test_core_equiv.py
-_upstream/  只读参考（ms-swift + LowRankClone，不导入）
-```
-
-## 用法
-
-```bash
-pip install -e /home/chenwh/Papers/twyd/_upstream/ms-swift
-pip install -e /home/chenwh/Papers/twyd
-swift pt --model <student> --dataset <data> \
-  --tuner_type core_lrc --loss_type lrc_distill \
-  --external_plugins twyd.plugin \
-  --tuner_kwargs '{"teacher_model":"<teacher>","student_hidden":1536}'
-# Dense 把 core_lrc 换成 dense_lrc；plain_lrc 为 matched 基线
-```
-
-### 训练前先过 step-0 体检（必须 PASS）
-
-```bash
-python scripts/check_init.py \
-  --teacher /home/chenwh/models/Llama-3.2-3B-Instruct \
-  --model   /home/chenwh/models/Llama-3.2-3B-Instruct \
-  --r 1536 --branch dense --seq-len 256
-```
-
-脚本会打印 teacher/student 的 CE、token acc 和逐层 hidden cosine。当前
-“teacher 权重 top-left slice” 初始化在 3072→512/1024 上会直接 FAIL
-（student CE≈11.8≈均匀分布，第 3 层 cos≈0.15），说明 warm start 没有跟踪
-teacher；这种情况下继续训练只会学到高频 token，评测必接近随机。通过
-P/ridge（论文 Alg.1 / App. A.4）或 LRC co-train→convert 的 warm start
-后再开训。
-
-### Zero-PT tensor-space warm start（Alg.1 / App. A.4）
-
-`scripts/calib_ridge.py` 已实现 **流式、逐层 greedy 的 ridge 校准**：
-只缓存 `C^T C` 和 `C^T H_T`，显存与校准 token 数无关；拟合 deployed `W`
-后精确分解成 `Z_col`（col path）和 `Z_perp`（补空间残差）。这是
-**校准分布上的最小二乘等价**，不是对所有输入的精确函数等价；`r < H`
-的压缩残差正是 `Z_perp` 和后续训练要处理的部分。
-
-```bash
-# 1) 无 HF 下载的数学 sanity check
-python scripts/calib_ridge.py --synthetic
-
-# 2) 从 teacher 直接构造 width-r student，校准并保存 merged HF + ridge_weights.pt
-#    先准备几百条 packed sequences（jsonl 里放 {"text": ...}）：
-python scripts/make_calib_ids.py --tokenizer /path/to/Llama-3.2-3B \
-  --input calib.jsonl --num-seqs 200 --seq-len 1024 --out outputs/calib_ids.pt
-
-python scripts/calib_ridge.py \
-  --teacher /path/to/Llama-3.2-3B \
-  --r 1536 --branch core --perp residual \
-  --teacher-device cpu \
-  --calib-ids /path/to/calib_ids.pt \
-  --num-seqs 200 --seq-len 1024 \
-  --out outputs/ridge-r1536
-# 24GB 卡上建议加 --teacher-device cpu，避免 teacher+student+basis 同时占 GPU
-
-# 3) 训练时在线校准（不需要离线 ckpt）
-TWYD_WARM_START=ridge \
-TWYD_CALIB_IDS=/path/to/calib_ids.pt \
-TWYD_RIDGE_PERP=residual \
-swift pt --model /path/to/teacher --tuner_type core_lrc ...
-
-# 4) 使用离线校准结果（保留补空间残差）
-TWYD_WARM_START=ridge_ckpt \
-TWYD_RIDGE_CKPT=outputs/ridge-r1536/ridge_weights.pt \
-swift pt --model /path/to/width-r-base --tuner_type core_lrc ...
-```
-
-- `--master-p embed_svd` 可选：先做 embedding-SVD 的全局 P 投影（head-aware），
-  但在 1B 上单独 P 仍过不了 gate，默认关闭；不要把它当作 zero-PT 的充分条件。
-- `--calib-attn` 可选：在 MLP 之前对 q/k/v/o 做 head-projected ridge；1B 上
-  与 P/MLP 组合仍 FAIL，默认关闭，仅作对照。
-- `--perp zero` 复现论文默认（`Z_perp=0`，step 0 精确等于 plain LRC）；
-  `--perp residual` 把 teacher 残差写进补空间（更快，但不再是 strict plain）。
-  日志的 `rel before -> deployed (fit=...)`：`deployed` 是合并后真实权重的误差，
-  `perp=zero` 时它可能明显高于 `fit`（down 尤其明显）。
-- 校准数据只需几百条 packed sequences；`.pt/.npy/.jsonl/.txt` 均可，
-  文本文件会自动加载 teacher tokenizer。
-- `--joint`（默认）每层一遍前向；`--greedy` gate/up 更新后重跑 down，
-  更精确但慢一倍。
-- `warm_start="ridge"` 只校准 MLP gate/up/down（论文 App. B 默认）；
-  attention/embedding 的 zoom/ridge 仍是下一步。
-- 一个重要的结构性事实：teacher 的 gate/up 输出天然落在 `col(T)` 内，
-  所以校准残差 `Z_perp` 在 gate/up 上通常≈0；补空间容量主要靠训练打开。
-  down 的目标是 `H→r` 的投影，残差会填充 `V⊥`，因此 residual init 对
-  down 更明显。不要因为 gate/up 的 `z_perp=0` 就认为校准失败。
-
-### 官方 LRC 权重和 TWYD SVD/ridge 的关系（重要）
-
-官方 LRC 发布的 1.5B 权重本质上是一个 **hidden-size 减半的 dense student**：
-它的 MLP 是 `d_ff × r` 的普通权重，**没有** `T`、`U⊥`、`Z_col`、`Z_perp`，
-也没有 SVD/ridge。SVD/ridge 是 TWYD 的后处理，不是官方权重自带的。
-
-TWYD 做的事情是：拿 teacher 的 SVD 基 `[T U⊥]`（它在 `R^{d_ff}` 里是完备的），
-把任意 width-r 的官方权重**精确重写**成
-
-```
-W_official = T Z_col^T + U⊥ Z_perp^T
-```
-
-这是坐标变换，不要求官方模型当初用 SVD 训练。随后可以选择：
-
-- `warm_start="base"`：**原样保留**官方权重（包括 `Z_perp`），只做精确重分解，
-  然后训 CORE-LR/补空间；这是推荐的 zero-PT 路径。
-- `warm_start="ridge"`：在校准集上重新拟合 MLP，会**覆盖**官方 MLP；
-  这是 TWYD 的可选重初始化，不是“官方 LRC 自带 ridge”，默认不建议直接用在
-  已经训练好的官方 base 上。
-
-官方 LRC base + CORE-LR 的正确用法：
-
-```bash
-# 1) 如果是 CoTrainLM/zoom 格式，先用 scripts/convert_ckpt.py 转成 merged HF
-# 2) 用 width-r 官方 checkpoint 作为 --model，warm_start=base 保留权重
-TWYD_WARM_START=base \
-TWYD_R=1536 \
-TWYD_FREEZE_COL=1 \
-TWYD_LORA_RANK=128 \
-TWYD_LORA_MODE=core \
-swift pt --model /path/to/official-lrc-r1536 --tuner_type core_lrc ...
-```
-
-`warm_start="base"` 只做重分解，不改 deployed 权重；`freeze_col=1` 冻结官方
-col path，只训低秩补空间。若想完整 CORE 训练，把 `freeze_col` 设为 0。
-
-### 7900 XTX / ROCm FlashAttention
-
-`twyd-flash` 里已经装了 `flash_attn` 的 **Triton 后端**（gfx1100），LRC 训练可以这样启用：
-
-```bash
-export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-export SWIFT=/home/chenwh/miniconda3/envs/twyd-flash/bin/swift
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-ATTN_IMPL=flash_attention_2 bash scripts/train_core_lr_pilot.sh
-```
-
-脚本默认 `ATTN_IMPL=sdpa`，不会改变现有行为；`--attn_impl` 会被
-`_shrink_student_` 保留（否则 width-shrink 会退回 teacher 的默认 attention）。
-
-在 7900 XTX 上的实测（Llama-3.2-1B，r=512，seq=2048，batch=1）：
-
-> **注意：下面这组数字是在 GPU1 仍被其他任务占用（GPU use ~75%）时测的，
-> 不是空闲 GPU 的干净 benchmark；绝对毫秒数会受共享负载影响，只能作方向性参考。**
-> `peak` 是当前进程的 `max_memory_allocated`，受外部任务影响较小。
-
-| attention | step | peak |
-|---|---:|---:|
-| `sdpa` + AOTriton | 192.6 ms | 6.34 GiB |
-| `flash_attention_2` (Triton) | 220.5 ms | 6.34 GiB |
-| `eager` / SDPA-math | OOM | >24 GiB |
-
-**为什么整步显存没降？** 因为 `sdpa` 本身已经走 AOTriton flash，且整步峰值不在
-attention，而在 loss/backward。r=512、seq=2048 的逐阶段峰值两种后端完全相同：
-
-```text
-forward  3.377 GiB
-loss     5.334 GiB   # float32 logits（vocab=128k）
-backward 6.312 GiB   # MLP d_ff=8192 激活 + 梯度
-```
-
-纯 attention 对照（8 heads、d=64、seq=4096、bf16、前向+反向）则能看出 flash 的价值：
-
-```text
-SDPA math       2.102 GiB
-SDPA AOTriton   0.036 GiB
-flash_attn      0.043 GiB
-```
-
-所以在 LRC 里，flash 只在 **attention 物化 S×S 会 OOM** 时救场；当 SDPA 已经使用
-AOTriton 时，它不会降低整步峰值，也不会额外提速。真正的显存大头是
-**teacher/student 权重、d_ff=8192 的 MLP 激活、以及 float32 logits/loss**。
-
-> 速度数字（192.6/220.5 ms）是在 GPU1 仍有其他任务时测的，绝对值受干扰；
-> 这里只能确认“整步显存峰值相同”，速度排名需空闲 GPU 成对复测。
-
-### 环境选择：twyd vs twyd-flash
-
-- **`twyd` 就够用于 LRC 训练 + SDPA/AOTriton flash**：它有
-  `torch 2.9.1+rocm6.4`、`aotriton.images/amd-gfx11xx`、`twyd` 和 `swift`。
-- **`twyd-flash` 不是 AOTriton 的必要条件**：它只是额外装了
-  `flash_attn` 的 Triton 后端（用于 `flash_attention_2` / `padding_free` /
-  `packing` / CK 编译实验）；目前没有原生 CK `.so`。
-- 因此：`ATTN_IMPL=sdpa` 用 `twyd`；只有 `ATTN_IMPL=flash_attention_2`
-  或要测 `flash_attn` API 时才需要 `twyd-flash`。
-
-### 2048 context 的建议
-
-2048 不需要额外安装 `flash_attn`：PyTorch SDPA 的 AOTriton 后端已经提供
-FlashAttention 的 `O(S)` attention 显存。主要脚本支持 `MAX_LENGTH`：
-
-```bash
-export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-MAX_LENGTH=2048 ATTN_IMPL=sdpa \
-R=512 K=128 bash scripts/train_core_lr_pilot.sh
-```
-
-2048 时真正的显存大头仍是 MLP（`d_ff=8192`）、float32 logits（vocab=128k）、
-teacher 和梯度；建议保持 `gradient_checkpointing=true`，teacher 放 CPU，
-必要时 `TWYD_USE_AUX=false` 或减小 micro-batch/用 Adafactor。
-
-```bash
-export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-ATTN_IMPL=sdpa bash scripts/train_core_lr_pilot.sh
-```
-
-只有需要 `flash_attn` / `padding_free` / `packing`，或 SDPA 退回 math 导致 OOM 时，
-再用 `flash_attention_2`。
-
-### 真实 1B gate 结果（2026-10-20，Llama-3.2-1B → r=512）
-
-
-同一 79-token 文本、同一 tokenizer、`branch=dense`：
-
-| 初始化 | student CE | mean cos | 备注 |
+| Student | Compression tokens | Avg9 | Reference |
 |---|---:|---:|---|
-| slice（top-left） | 11.90 | 0.168 | hidden norm 16–20，attention 后爆掉 |
-| MLP ridge（无 P） | 11.15 | 0.219 | CE 有改善，但仍 FAIL |
-| embedding-SVD P only（select） | 11.95 | 0.146 | norm 正常（0.68–3.9），方向仍不对 |
-| embedding-SVD P only（merge heads） | 11.76 | 0.171 | 比 select 略好，仍 FAIL |
-| P + MLP ridge | 15.60 | 0.114 | 局部 ridge 破坏全局 residual，反而更差 |
-| P + attention ridge + MLP ridge | 15.88 | 0.117 | 逐层 q/k/v/o ridge 仍不等于 attention 语义 |
+| Sheared-LLaMA 2.7B | 50B | 52.55 | prune + retrain |
+| **TWYD 1.5B** (from Llama-3.2-3B) | **10B** | **66.21** | teacher = 66.18 |
+| TWYD 2.7B (from Llama-3.1-8B) | 10B | **68.93** | official 8B compression = 66.18 |
+| Minitron 4B | 94B | 68.31 | prune + retrain |
+| Llama-3.2-3B (official) | ~9,000B | 66.18 | same-lineage reference |
 
-结论：**MLP-only ridge、全局 P、以及逐层 q/k/v/o ridge 都不足以从零构造一个可训练的学生**；
-真正的 blocker 是 attention 的 head reduction/softmax 与逐层非线性耦合，线性 ridge
-无法保持 attention 语义。`master_p` 和 `--calib-attn` 保留为实验选项，默认关闭；
-zero-PT 的现实路径是“官方 LRC width-r base + `warm_start=base` + CORE-LR”，
-或者实现论文的 attention zoom / LRC co-training。若在官方 base 上用 `ridge`，
-那是在 TWYD 坐标系里重拟合，不是官方权重自带的能力。
+**The widest, hardest target is where the thesis pays off most.** Qwen2.5-3B → 1.7B (`ρ=5.375`,
+81.4% stranded):
+
+| Arm (10B PT, matched) | Avg9 |
+|---|---:|
+| plain LRC (matched baseline) | 52.99 |
+| Dense-LRC (same-lineage, strictly controlled) | 59.38 (**+6.39**) |
+| **CORE-LRC (teacher-spectral)** | **63.44 (+10.45)** |
+| plain LRC at its original ~20B budget | 63.43 |
+
+That is **2× token efficiency**: 10B tokens reach the accuracy of the original ~20B recipe. The
+equal-parameter control confined to `col(T)` recovers **none** of the gain (64.02 vs 64.04) — the effect
+is the opened reachable set, not extra parameters.
+
+**Customer economics** (weights only): a 3B teacher at BF16 needs **6.0 GB**; the TWYD 1.5B student needs
+**3.0 GB**; FP8 halves it again to **1.5 GB** — same deployment stack, no custom kernels.
+
+<sub>All numbers from the TWYD paper (arXiv:2609.02006) unless marked; 0-shot Avg9 over nine tasks;
+single-seed; TWYD rows include a short 0.62B-token SFT. The ~900× is a compression-stage token count under
+unmatched recipes, not a compute claim. MMLU is −5.7 vs the teacher (reduced hidden width; recovers as width
+grows) while CSQA is +7.2; knowledge-heavy deployments are paired with on-prem RAG.</sub>
+
+---
+
+## Landscape
+
+| Approach | Examples | Compression cost | Params cut | Deploy overhead | Main gap |
+|---|---|---|---|---|---|
+| Quantization | FP8 / INT4 toolkits | Low (calibration) | No | Needs kernel support | Bytes only; **stacks with TWYD** |
+| Prune + retrain | Minitron, Sheared-LLaMA | 50–94B tokens | Yes | None | Costly retraining |
+| Weight-inheritance distillation | LRC | ~10–20B tokens | Yes | None | **62.5–81.4% of the matrix locked** |
+| Tensor-network compression | Multiverse CompactifAI | Proprietary | Yes | Proprietary pipeline | $570M Series C; entering the Middle East |
+| **TWYD** | **OmniReach AI** | **~10B tokens** | **Yes** | **None (standard dense)** | Single-seed today; MoE next |
+
+---
+
+## Product
+
+Land with a benchmark, expand to licenses and royalties.
+
+| Stage | Who | What they get | Price | When |
+|---|---|---|---|---|
+| **1 · Compression Sprint** | AI and platform teams with a fine-tuned 3–8B model to run on-prem or at the edge | A half-size **standard dense** model, validated on their own evals | fixed fee per model, **US$40–100K** | 4–6 weeks per model |
+| **2 · TWYD Engine (license)** | sovereign clouds and model providers compressing many models | the software and support to run TWYD on their own GPUs | annual license, **US$150–400K** | after 3+ sprints |
+| **3 · Edge Turnkey** | robot, vehicle and inspection OEMs | a compressed FP8 model running on the target chip (Orin, Jetson, RK3588) | **US$100–300K** + per-device royalty | with the first edge pilot |
+
+**First step:** a free public benchmark compressing a regional open model (Falcon or Jais), then a paid
+Sprint. Pricing ranges are initial assumptions to be validated in the first pilots.
+
+```mermaid
+flowchart LR
+    P["1. Prove<br/>free regional benchmark<br/>Falcon / Jais"] --> L["2. Land<br/>paid Compression Sprint<br/>US$40-100K"]
+    L --> E["3. Expand<br/>annual license or<br/>per-device royalty"]
+    E --> R["recurring revenue<br/>+ model zoo"]
+```
+
+---
+
+## Roadmap
+
+Three stages, each behind an explicit gate.
+
+| Stage | Scope | Gate |
+|---|---|---|
+| **V1 · Demonstrated** | Full-MLP LRC (Dense and CORE) on one 8-GPU node, ~10B tokens; plain dense 1.5B–2.7B students | multi-seed replication: headline V1 results hold across seeds |
+| **V1.5 · CORE-LR** | per-layer/per-projection **rank allocator**; **factorized** low-rank execution; target: two consumer GPUs | Qwen2.5-3B→1.7B within **0.5 Avg9** of full CORE at **≤25%** of trainable coordinates |
+| **V2 · TWYD-MoE** | router-aware cross-expert compression, Qwen3-30B-A3B first; MoE→MoE (halve server memory) and MoE→Dense (edge chips with poor sparse routing) | expert-level Pareto + merge parity + load balance |
+
+```mermaid
+gantt
+    title 12-month plan (seed)
+    dateFormat  YYYY-MM-DD
+    axisFormat  %b
+    section Core research
+    CORE-LR on 2 consumer GPUs      :a1, 2026-11-01, 90d
+    Multi-seed replication          :a2, after a1, 45d
+    Falcon / Jais public benchmark  :a3, 2027-01-15, 60d
+    section MoE
+    TWYD-MoE on 8-GPU node          :b1, 2027-02-15, 150d
+    Qwen3-30B-A3B + multimodal MoE  :b2, after b1, 60d
+    section Commercial
+    Open-source release             :c1, 2026-12-15, 30d
+    Regional pilots (gov/energy)    :c2, 2027-06-01, 120d
+    Paid contract or LOI            :c3, 2027-09-01, 90d
+```
+
+**What V1.5 has to prove (the seed's core technical bet):** a rank-`k` complement with `k ≤ 256`
+recovers the full-CORE result while training **≤25%** of its coordinates, with a measurable step-time or
+optimizer-memory win. On Llama-3B→1.5B that is 143M coordinates vs 660M (21.7%), and the factorized
+forward is already within 1.21× of a dense layer.
+
+---
+
+## Defensibility
+
+| Moat | Why it compounds | The objection it answers |
+|---|---|---|
+| **Open-core adoption** | Open-source the base TWYD pipeline to build a standard; keep the CORE-LR **rank allocator** and **MoE router alignment** proprietary | "a published method can be copied" |
+| **Edge delivery experience** | Founder shipped FP8 + vLLM cockpit inference (800 ms → <300 ms) and <10 ms perception on NVIDIA Orin in production | "research that never reaches a device" |
+| **90-day validation plan** | Multi-seed results and a Falcon/Jais compression benchmark published openly within 90 days | "single-seed evidence" |
+| **Low cost to compress** | ~10B distillation tokens today, with a path to two consumer GPUs, keeps delivery cost and pilot price low | "delivery cost and team size" |
+
+The category is already funded — Multiverse Computing's **$570M Series C** validates demand. We compete
+on **cost to compress** and **zero deployment overhead**, not on owning a formula.
+
+---
+
+## Team
+
+**Wenhui Chen — Founder & Chief Scientist**
+
+- M.S. Computer Science, University of Macau; ~10 years taking AI to production.
+- Bosch: L2+ perception, **<10 ms on NVIDIA Orin**.
+- Qianli Technology: cockpit LLM for Geely and Mercedes-Benz programs, **800 ms → <300 ms**.
+- U.S. AI lab: large-cluster post-training of **100B+ MoE** models.
+- Xiaomi's first AI robot vacuum: vision module at **million-unit scale**.
+- First author of TWYD; more papers under review.
+
+**Planned hires with the seed:** ML research engineer (distillation, MoE) · systems engineer (kernels,
+inference stack) · regional commercial lead.
+
+**Execution to date:** first-author TWYD paper (arXiv:2609.02006); independent implementation on
+ms-swift; compression results on Llama and Qwen teachers; CORE-LR running end-to-end on consumer GPUs.
+
+---
+
+## The ask
+
+**Seed US$1.5–2.0M · 12 months · planned incorporation ADGM, Abu Dhabi (UAE).**
+Open to a non-dilutive grant with equivalent sovereign compute.
+
+| Use of funds | Share | What it buys |
+|---|---:|---|
+| Compute and MoE R&D | **50%** | rented 8-GPU node, 0.2–0.5B-token runs, multi-seed replication |
+| Engineering hires | **35%** | ML research engineer + systems engineer (kernels, inference) |
+| ADGM incorporation and regional pilots | **15%** | legal/incorporation, 1–2 government/energy/mobility pilots |
+
+| Months | Milestone |
+|---|---|
+| 1–3 | CORE-LR validated on two consumer GPUs; multi-seed results; open-source release; first Falcon/Jais benchmark |
+| 4–8 | TWYD-MoE on an 8-GPU H100/B300-class node; Qwen3-30B-A3B and a multimodal MoE |
+| 9–12 | 1–2 regional pilots in government, energy or mobility; paid contract or LOI; multimodal edge interaction <300 ms |
+
+---
+
+## Engineering status (this repository)
+
+This repository is the **independent, reproducible implementation** behind the paper. It is also the
+technical diligence package: every claim above can be re-run.
+
+| Component | Status |
+|---|---|
+| `plain_lrc` / `dense_lrc` / `core_lrc` tuners + `lrc_distill` loss | ✅ running end-to-end on ms-swift |
+| Step-0 gate (`check_init.py`) | ✅ PASS: 84 CORE-LR modules, **71.6M** trainable, CE 3.181 vs teacher 3.081, top-1 agreement 0.769 |
+| Merge / deployment contract (`check_merge_parity.py`) | ✅ exported weights exact (`max|ΔW| = 0`), zero extra params/FLOPs |
+| CORE-LR factorized forward | ✅ **1.21×** a dense layer per step (vs 3.67× merged rebuild) |
+| P6 equal-parameter `col(T)` control | ✅ implemented (`TWYD_PERP_BASIS=col`) with a regression test |
+| Rank spectrum + budget tooling | ✅ `measure_complement_rank.py`, `param_budget.py`, `bench_layer_flops.py` |
+| Tests | ✅ **57 passed** (`pytest tests -q`) |
+
+**Currently running:** two matched 20M-token arms on FineWeb-Edu `int_score>=4` (Dense-LRC on one
+7900 XTX, CORE-LR k=128 on the other), to produce the first held-out Pareto point and the complement
+rank spectrum.
+
+**Honest limits:** paper results are single-seed; the auxiliary alignment term here covers hidden states
+on 4 layers (not the full Eq. 7); screening runs use 512-token sequences and a 60M-token corpus, not the
+paper's 10B-token recipe; Qwen targets require rented compute. None of these affect the A/B comparison,
+and all are tracked in the technical docs.
+
+| Document | Contents |
+|---|---|
+| [`docs/TECHNICAL.md`](docs/TECHNICAL.md) | math, three realizations, gate contract, CORE-LR internals, tooling, performance, known deviations |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | research plan, experiment matrix, MoE plan, go/no-go gates, company plan |
+| [`docs/figures/`](docs/figures) | standalone TikZ sources + rendered PNG/PDF for the two key figures |
+
+<p align="center">
+  <img src="docs/figures/core_lr_pipeline.png" alt="CORE-LR pipeline: teacher SVD, frozen column path, rank-k complement, merge, deploy" width="720"/>
+</p>
+
+<p align="center"><sub><b>Figure 2.</b> CORE-LR. The teacher SVD defines a frozen column path and a rank-<code>k</code>
+complement path (<code>B=0</code> at step 0). At export both fold into one dense <code>d_ff x r</code> weight.
+Source: <a href="docs/figures/core_lr_pipeline.tex"><code>docs/figures/core_lr_pipeline.tex</code></a>.</sub></p>
+
+---
+
+## Links
+
+- Paper: **Train What You Deploy** — [arXiv:2609.02006](https://arxiv.org/abs/2609.02006)
+- Code: [github.com/wenhui-ml/twyd](https://github.com/wenhui-ml/twyd)
+- Built on published research: Low-Rank Clone (Hao et al., NeurIPS 2025), on open-source ms-swift,
+  open-source models and permissively licensed datasets.
+- License: open-core planned (Apache-2.0 for the base pipeline); commercial layer licensed separately.
+
+<div align="center"><sub>OmniReach AI · Confidential seed brief · October 2026</sub></div>
 
 
-详见 `twyd/config.py`（`tuner_kwargs` 直透）与 `scripts/`。
+

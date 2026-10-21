@@ -193,10 +193,11 @@ def test_calibrate_attention_tiny_hf():
     student = _shrink_student_(teacher, teacher, 16)
     P = torch.eye(32)[:16]
     S_q, S_kv = head_projection_mats(cfg, 16, P, "select")
-    assert S_q.shape == (16, 32) and S_kv.shape == (8, 16)
+    # LRC keeps teacher heads: q/k/v width = 4*8 = 32, kv width = 2*8 = 16.
+    assert S_q.shape == (32, 32) and S_kv.shape == (16, 16)
     S_q2, S_kv2 = head_projection_mats(cfg, 16, P, "merge")
-    assert torch.allclose(S_q2.sum(1), torch.ones(16), atol=1e-5)
-    assert torch.allclose(S_kv2.sum(1), torch.ones(8), atol=1e-5)
+    assert torch.allclose(S_q2, torch.eye(32), atol=1e-6)
+    assert torch.allclose(S_kv2, torch.eye(16), atol=1e-6)
     q_before = student.get_submodule("model.layers.0.self_attn.q_proj").weight.detach().clone()
     ids = torch.randint(0, 128, (4, 16))
     rep = calibrate_attention(student, teacher, ids, P=P, head_mode="select",
