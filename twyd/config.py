@@ -43,6 +43,7 @@ class TwydLRCConfig:
     lora_alpha: float = 16.0    # LoRA scaling = alpha / rank
     lora_mode: str = "dense"    # "dense" | "core": LoRA 挂在 deployed 权重还是补空间
     lora_layers: str = ""       # e.g. "0-8": 只在这些层挂 LoRA，其余保持 plain
+    lora_modules: str = ""      # e.g. "gate_proj,up_proj": 只训这些投影（空=全部）
     lora_lr: Optional[float] = None  # 补空间 LoRA 独立学习率（None=跟随全局 lr）
     freeze_col: bool = False    # CORE: 冻结 plain-LRC col path，只训补空间（CORE-LR）
     rank_map: str = ""          # JSON dict or path: module name -> per-module k

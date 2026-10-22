@@ -108,7 +108,15 @@ $$
 $Z_\perp$ is zero-initialized, so step 0 is exactly the plain-LRC student and the warm start is never
 perturbed. At export both paths fold into one $d_{ff}\times r$ matrix (zero added parameters/FLOPs).
 
-### 2.4 CORE-LR (the research contribution in this repo)
+### 2.4 CORE-LR (optional efficiency variant)
+
+> **Dense-LRC is the default.** It is the simplest object with no extra state, the fastest step time, and
+> the variant that carries the paper's strictly controlled `+6.39`. `CORE-LR(k)` is kept only as an
+> ablation and as a **reported negative result**: it trades a 9.26 GiB frozen basis for a 15× smaller
+> optimizer state, loses on peak memory and step time (§10 ledger), *and* the premise — a low-rank learned
+> complement — does not hold. The trained checkpoint's complement has `top128_energy = 0.204`
+> (effective rank 1285 of 1536), far under the 0.40 kill threshold registered in
+> [`ROADMAP.md`](ROADMAP.md) §0.4 before the measurement (§0.6 records the decision).
 
 Full CORE trains $r(d_{ff}-H)$ complement coordinates per projection — on Llama-3B→1.5B that is
 **660M** trainable coordinates, and the frozen bases cost 11.2 GiB. CORE-LR factorizes the complement
@@ -347,6 +355,7 @@ right (down):    W = Z_col R   + (A B^T) V_perp * scaling        W: r x d_ff
 | `scripts/check_init.py` | is the warm start alive at step 0? (gate) |
 | `scripts/check_merge_parity.py` | does the exported merged model equal the trained one? |
 | `scripts/measure_complement_rank.py` | how many complement directions did training actually use? |
+| `scripts/rank_layers.py` | **which layers/projections** used the opened complement? → `LORA_LAYERS` plans for selective unfreezing |
 | `scripts/bench_layer_flops.py` | what does one MLP projection cost per step, per realization? |
 | `scripts/validate_core_lr.py` | are factorized and merged forwards/backwards numerically equal? |
 | `scripts/calib_ridge.py` | data-aware zero-PT warm start (streaming ridge) |
@@ -380,10 +389,27 @@ Single-layer cost at `seq=512` (`scripts/bench_layer_flops.py`, H=2048, d_ff=819
 | CORE-LR k=128 merged | 5.319 | 3.67× |
 | **CORE-LR k=128 factorized** | **1.758** | **1.21×** |
 
-Memory on the reference pair (CORE-LR k=128, factorized): frozen complement basis is 7.0 GiB on
-device, `W_col` cache 2.1 GiB, teacher 6.0 GiB, student + activations the rest — measured 17.6–18.6 GiB
-at `seq=512–1024`. Dense-LRC (1.057B trainable) peaks at 17.3–19.5 GiB at `seq=512`, and 23.2 GiB at
-`seq=1024` (too close to the 24 GB limit; use 512 or a bigger card).
+**Memory ledger (measured, 20M-token arms, `seq=512`, same teacher):**
+
+| component | Dense-LRC | CORE-LR k=128 |
+|---|---:|---:|
+| trainable weights | 1.97 GiB | 0.13 GiB (LoRA A/B) |
+| gradients | 1.97 GiB | 0.13 GiB |
+| AdamW states (4 B/param) | 3.94 GiB | 0.27 GiB |
+| **trainable subtotal** | **7.88 GiB** | **0.53 GiB** |
+| frozen `Z_col` | — | 0.74 GiB |
+| frozen complement basis `U⊥` | — | **6.55 GiB** |
+| `W_col` cache (factorized forward) | — | 1.97 GiB |
+| teacher (pinned) | 5.98 GiB | 5.98 GiB |
+| non-MLP student + activations | 2.65 GiB | 2.41 GiB |
+| **peak (torch)** | **17.32 GiB** | **18.78 GiB** |
+| step time | **8.52 s** | 11.78 s |
+
+The 15× optimizer saving is more than offset by 9.26 GiB of frozen basis and cache, and the per-forward
+`BᵀU⊥ᵀ` rebuild (∝ `k·(d_ff−H)·d_ff`, independent of tokens) makes short-sequence steps slower. On
+24 GB cards the actionable memory knob is therefore **which layers are unfrozen** (`LORA_LAYERS`), not a
+rank factorization; dense at `seq=1024` peaks at 23.2 GiB (too close to the limit), CORE-LR fits but
+pays the basis.
 
 Throughput (single card, `seq=512`, 16,384 tokens/step): dense ≈ 1.8k tok/s (8.98 s/step), CORE-LR
 ≈ 2.5k tok/s. Full-CORE `K=0` has no factorized forward yet, so every step rebuilds `d_ff×r` and runs
@@ -405,9 +431,10 @@ flowchart LR
 | Gate | Criterion |
 |---|---|
 | G0 init | student CE ≤ 6.0, token acc ≥ 0.2 and ≥ 0.5× teacher, agreement ≥ 0.3 |
-| G1 full CORE | Qwen: CORE > Dense; Llama: CORE ≈ Dense (paper reports a tie) |
-| G2 low rank | `k ≤ 256`, within 0.5 Avg9 (or ≤0.05 nats held-out CE) of full CORE, coordinates ≤ 25% of full CORE |
-| G3 cost | factorized step time ≤ 0.9× dense, or optimizer state ≤ 70% |
+| G1 full-MLP | Qwen: Dense > plain LRC; Llama: Dense ≈ CORE (paper reports a tie) |
+| **G2 selective** | layer-selective dense (`LORA_LAYERS=0-5`) within 0.5 Avg9 of full dense at ≤1/3 trainable state |
+| G2b low rank (conditional) | `k ≤ 256`, within 0.5 Avg9 (or ≤0.05 nats held-out CE) of full CORE, coordinates ≤ 25% — only if the ROADMAP §0.4 trigger fires |
+| G3 cost | at matched tokens/config: peak VRAM ≤ dense and step time ≤ dense + 10% |
 | G4 MoE | only after G2/G3 pass |
 
 **Budget math (Llama-3B→1.5B).** Full CORE (frozen column) = 660M coordinates; CORE-LR k=256 =
@@ -443,6 +470,10 @@ These are real and should be disclosed with any number produced by this repo.
    the paper's 10B-token mixed recipe; sequence length is 512, not 2048. AUX is disabled for those
    screening arms because the official LRC base's hidden states are not in the teacher basis
    (`L_align ≈ 400` would dominate the loss without the Alg.1 master projection `P`).
+8. **CORE-LR's optimizer win does not show up as a VRAM win.** At `seq=512` it saves 7.35 GiB of
+   trainable state but adds 9.26 GiB of frozen basis + `W_col`, landing 1.5 GiB *above* dense, and its
+   step is 1.38× slower. Dense-LRC is the default; the ROADMAP §0.4 spectrum trigger decides whether the
+   rank-`k` track is revived with a fixed implementation.
 
 ## 13. Reproducibility log
 

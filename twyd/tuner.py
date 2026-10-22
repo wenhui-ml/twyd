@@ -641,6 +641,8 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
     except Exception:
         _module_rank, rank_map = (lambda _rm, _n, _d=0: int(_d)), {}
     lora_layers_spec = str(getattr(cfg, "lora_layers", "") or "")
+    sel_projs = {s.strip() for s in str(getattr(cfg, "lora_modules", "") or "").split(",")
+                 if s.strip()}
     try:
         from .config import parse_layer_range as _parse_lr
         n_lay = int(getattr(getattr(student, "config", None), "num_hidden_layers", 0) or 0)
@@ -682,7 +684,8 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                     _li = _layer_idx(mod_name)
                 except Exception:
                     _li = None
-                in_lora_set = (not lora_layer_active) or (_li is None) or (_li in lora_layer_set)
+                in_lora_set = (((not sel_projs) or short in sel_projs)
+                               and ((not lora_layer_active) or (_li is None) or (_li in lora_layer_set)))
                 rank_here = int(_module_rank(rank_map, mod_name, lora_rank))
                 rank_here = max(0, min(rank_here, r, d_ff - H))
                 use_lora_here = (rank_here > 0) and in_lora_set
@@ -750,7 +753,8 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                     _li = _layer_idx(mod_name)
                 except Exception:
                     _li = None
-                in_lora_set = (not lora_layer_active) or (_li is None) or (_li in lora_layer_set)
+                in_lora_set = (((not sel_projs) or short in sel_projs)
+                               and ((not lora_layer_active) or (_li is None) or (_li in lora_layer_set)))
                 rank_here = int(_module_rank(rank_map, mod_name, lora_rank))
                 rank_here = max(0, min(rank_here, r, d_ff - H))
                 use_lora_here = (rank_here > 0) and in_lora_set
@@ -814,6 +818,8 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
 def _freeze_for_branch(wrapper, cfg) -> None:
     lora_rank = int(getattr(cfg, "lora_rank", 0) or 0)
     lora_layers_spec = str(getattr(cfg, "lora_layers", "") or "")
+    sel_projs = {s.strip() for s in str(getattr(cfg, "lora_modules", "") or "").split(",")
+                 if s.strip()}
     # Direction 1 (Fig.8b): when lora_layers is set, ONLY those layers train;
     # everything else stays frozen plain (zero grad, zero optimizer state).
     try:
@@ -832,6 +838,10 @@ def _freeze_for_branch(wrapper, cfg) -> None:
             _li = None
         if layer_active and _li is not None and _li not in lora_layer_set:
             continue  # deep frozen-plain layers: keep requires_grad False
+        parts = n.split(".")
+        short = parts[-2] if len(parts) >= 2 else ""
+        if sel_projs and short not in sel_projs:
+            continue  # projection-level selection: keep this projection frozen
         if cfg.branch == "dense":
             # full dense-lrc: 整块 deployed 权重可训；
             # LoRA-Dense: 只训 lora_A/lora_B，base_weight 保持冻结。
@@ -1117,6 +1127,7 @@ def _twyd_kw(args) -> dict:
         "lora_alpha": _os.environ.get("TWYD_LORA_ALPHA", None),
         "lora_mode": _os.environ.get("TWYD_LORA_MODE", None),
         "lora_layers": _os.environ.get("TWYD_LORA_LAYERS", None),
+        "lora_modules": _os.environ.get("TWYD_LORA_MODULES", None),
         "lora_lr": _os.environ.get("TWYD_LORA_LR", None),
         "freeze_col": _os.environ.get("TWYD_FREEZE_COL", None),
         "rank_map": _os.environ.get("TWYD_RANK_MAP", None),
@@ -1208,6 +1219,7 @@ def _prepare_model_impl(args, model, branch: str):
               lora_alpha=kw.get("lora_alpha", 16.0),
               lora_mode=str(kw.get("lora_mode", "dense")).lower(),
               lora_layers=str(kw.get("lora_layers", "") or ""),
+              lora_modules=str(kw.get("lora_modules", "") or ""),
               lora_lr=kw.get("lora_lr", None),
               freeze_col=bool(kw.get("freeze_col", False)),
               rank_map=str(kw.get("rank_map", "") or ""),

@@ -21,7 +21,9 @@ class FakeBlock(torch.nn.Module):
     def __init__(self, hid, ff, nlayer=2):
         super().__init__()
         self.layers = torch.nn.ModuleList([FakeMLP(hid, ff) for _ in range(nlayer)])
-        self.config = type("C", (), {"hidden_size": hid})()
+        # num_hidden_layers is what layer-range parsing (`lora_layers`) reads.
+        self.config = type("C", (), {"hidden_size": hid,
+                                     "num_hidden_layers": nlayer})()
 
 
 def _make_pair(H=24, d_ff=64, r=12):
@@ -172,6 +174,51 @@ def test_rank_map_resolves_per_module_and_builds_variable_k():
     # L1 gate4/up4/down3.
     expected = (2 + 4 + 3 + 4 + 4 + 3) * (r + d_ff - H)
     assert sum(p.numel() for p in w.student.parameters() if p.requires_grad) == expected
+
+
+def test_dense_projection_selection_trains_only_selected_projections():
+    """Projection-level budget: only the named MLP projections stay trainable."""
+    H, d_ff, r = 24, 64, 12
+    teacher, student = _make_pair(H, d_ff, r)
+    cfg = TwydLRCConfig(branch="dense", student_hidden=r,
+                        target_modules=["gate_proj", "up_proj", "down_proj"],
+                        lora_rank=0, lora_modules="gate_proj")
+    meta = _build_factorized_student(student, teacher, cfg, branch="dense")
+    w = _TwydWrapper(student, teacher, cfg)
+    w.twyd_cfg = cfg
+    w.twyd_meta = meta
+    _freeze_for_branch(w, cfg)
+
+    names = [n for n, p in w.student.named_parameters() if p.requires_grad]
+    assert names and all(".gate_proj." in n for n in names), names
+    # 2 layers x one projection x (d_ff x r)
+    assert sum(p.numel() for p in w.student.parameters() if p.requires_grad) == 2 * r * d_ff
+
+
+def test_dense_layer_selection_trains_only_selected_layers():
+    """Layer-selective full-MLP (paper Fig.8b): only `lora_layers` stay trainable.
+
+    On two consumer GPUs the memory knob is *which layers* get the full-MLP
+    weight, not a rank-k factorization: unfreezing 6 of 28 layers cuts the
+    trainable/optimizer state by ~5x with the same deployed shape.
+    """
+    H, d_ff, r = 24, 64, 12
+    teacher, student = _make_pair(H, d_ff, r)
+    cfg = TwydLRCConfig(branch="dense", student_hidden=r,
+                        target_modules=["gate_proj", "up_proj", "down_proj"],
+                        lora_rank=0, lora_layers="0-0")
+    meta = _build_factorized_student(student, teacher, cfg, branch="dense")
+    assert meta, "builder produced no modules"
+    w = _TwydWrapper(student, teacher, cfg)
+    w.twyd_cfg = cfg
+    w.twyd_meta = meta
+    _freeze_for_branch(w, cfg)
+
+    names = [n for n, p in w.student.named_parameters() if p.requires_grad]
+    assert names and all(n.startswith("layers.0.") for n in names), names
+    # 3 MLP projections of a d_ff x r dense weight, one layer only
+    n_train = sum(p.numel() for p in w.student.parameters() if p.requires_grad)
+    assert n_train == 3 * r * d_ff, n_train
 
 
 def test_col_completion_control_same_params_but_no_new_directions():

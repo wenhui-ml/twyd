@@ -22,6 +22,11 @@ R=${R:-1536}
 BRANCH=${BRANCH:-core}                    # core | dense | plain (plain = matched LRC baseline)
 LORA_MODE=${LORA_MODE:-core}              # core = rank-k complement (CORE-LR); dense = Dense-LoRA
 PERP_BASIS=${PERP_BASIS:-teacher}         # teacher = CORE-LR; col = P6 equal-parameter control
+# Layer-selective unfreezing: only these layers get the adapter / full-MLP weight,
+# the rest stay frozen plain LRC.  Paper Fig.8b: early layers carry the dependence.
+LORA_LAYERS=${LORA_LAYERS:-}
+# Projection-level selection, e.g. "gate_proj,up_proj" (empty = all three).
+LORA_MODULES=${LORA_MODULES:-}
 K=${K:-256}
 # LoRA scaling = alpha / k.  CORE-LR's update is Z_perp = (A B^T) * scaling, so
 # alpha=2k doubles the step size relative to full CORE (which updates Z_perp
@@ -31,7 +36,16 @@ ALPHA=${ALPHA:-$K}
 LR=${LR:-1e-4}
 ATTN_IMPL=${ATTN_IMPL:-sdpa}
 MAX_LENGTH=${MAX_LENGTH:-1024}
+CLIP=${CLIP:-1.0}
+SEED=${SEED:-42}
+# Multi-GPU / memory knobs.  NPROC>1 launches one job across N cards (swift reads
+# NPROC_PER_NODE); DS=zero2_offload shards the optimizer across cards and keeps it on
+# CPU, which is what makes the full 28-layer arm fit at seq=2048 on 24 GB cards.
+NPROC=${NPROC:-1}
+DS=${DS:-}
 MAX_STEPS=${MAX_STEPS:-2000}
+SAVE_STEPS=${SAVE_STEPS:-$MAX_STEPS}
+RESUME=${RESUME:-0}      # 1 = --resume_from_checkpoint (picks up the newest ckpt in OUT)
 GRAD_ACCUM=${GRAD_ACCUM:-16}
 # Per-device micro-batch.  bs=1 with seq>=1024 leaves the GPU under-utilized
 # (~1.4k tok/s measured on one 7900 XTX); raise it until VRAM is the limit.
@@ -41,6 +55,15 @@ STAGE=${STAGE:-sft}                       # sft | pt (paper: 10B PT then ~0.6B S
 # silently shrank a 30k-document PT corpus to 3k short ones.  'split' keeps all
 # content as multiple max_length chunks (no cross-document attention).
 TRUNC=${TRUNC:-split}                     # delete | left | right | split
+# Dataset preprocessing cost: swift encodes the whole corpus before training. With
+# num_proc=1 a 1B-token corpus takes ~15 min per run; with 16 procs + the HF cache
+# only the *first* run pays it (the cache key includes max_length / truncation).
+DATA_PROC=${DATA_PROC:-16}
+DATA_CACHE=${DATA_CACHE:-true}
+# ROCm allocator: expandable segments cut fragmentation. At seq=2048 the full 28-layer
+# arm sits at 23.8/24 GiB without it, which is too little headroom for a multi-day run.
+export PYTORCH_HIP_ALLOC_CONF=${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 DATASET=${DATASET:-swift/ultrachat_200k#100000}
 SWIFT=${SWIFT:-/home/chenwh/miniconda3/envs/twyd/bin/swift}
 OUT=${OUT:-/home/chenwh/Papers/twyd/output/core-lr-r${R}-k${K}}
@@ -82,6 +105,8 @@ export TWYD_TARGET_MODULES='gate_proj,up_proj,down_proj'
 export TWYD_LORA_RANK="$K"
 export TWYD_LORA_ALPHA="$ALPHA"
 export TWYD_LORA_MODE="$LORA_MODE"
+export TWYD_LORA_LAYERS="$LORA_LAYERS"
+export TWYD_LORA_MODULES="$LORA_MODULES"
 export TWYD_FREEZE_COL=${FREEZE_COL:-true}
 export TWYD_RANK_MAP="$RANK_MAP"
 export TWYD_FACTORIZED="$FACTORIZED"
@@ -96,7 +121,7 @@ echo "=============================="
 echo "branch=$BRANCH lora_mode=$LORA_MODE perp_basis=$PERP_BASIS stage=$STAGE r=$R k=$K alpha=$ALPHA lr=$LR steps=$MAX_STEPS"
 echo "bs=$BS grad_accum=$GRAD_ACCUM seq=$MAX_LENGTH trunc=$TRUNC tokens/step=$((BS * GRAD_ACCUM * MAX_LENGTH * ${NPROC_PER_NODE:-${WORLD_SIZE:-1}}))"
 echo "teacher=$TEACHER model=$MODEL dataset=$DATASET"
-echo "warm_start=$WARM_START rank_map=${RANK_MAP:-uniform} factorized=$FACTORIZED"
+echo "warm_start=$WARM_START rank_map=${RANK_MAP:-uniform} factorized=$FACTORIZED lora_layers=${LORA_LAYERS:-all} lora_modules=${LORA_MODULES:-all}"
 echo "model_type=${MODEL_TYPE:-auto} template=${TEMPLATE:-auto}"
 echo "out=$OUT"
 echo "=============================="
@@ -115,6 +140,8 @@ if [ "$GATE" = "1" ]; then
     --teacher "$TEACHER" --model "$MODEL" --r "$R" --branch "$BRANCH" \
     --warm-start "$WARM_START" --lora-rank "$K" --lora-mode "$LORA_MODE" \
     --perp-basis "$PERP_BASIS" \
+    --lora-layers "$LORA_LAYERS" \
+    --lora-modules "$LORA_MODULES" \
     --rank-map "$RANK_MAP" \
     --seq-len "$GATE_SEQ_LEN" "${GATE_EXTRA[@]}" \
     || { echo "[gate] FAILED: fix the LRC warm start before training"; exit 1; }
@@ -138,6 +165,12 @@ fi
 MODEL_ARGS=()
 if [ -n "$MODEL_TYPE" ]; then MODEL_ARGS+=(--model_type "$MODEL_TYPE"); fi
 if [ -n "$TEMPLATE" ]; then MODEL_ARGS+=(--template "$TEMPLATE"); fi
+CACHE_ARGS=()
+if [ "$DATA_CACHE" = "true" ]; then CACHE_ARGS+=(--load_from_cache_file true); fi
+DS_ARGS=()
+if [ -n "${DS:-}" ]; then DS_ARGS+=(--deepspeed "$DS"); fi
+if [ "${RESUME:-0}" = "1" ]; then DS_ARGS+=(--resume_from_checkpoint True); fi
+if [ "${NPROC:-1}" -gt 1 ]; then export NPROC_PER_NODE="${NPROC}"; fi
 
 "$SWIFT" "$STAGE" \
   --model "$MODEL" \
@@ -150,13 +183,18 @@ if [ -n "$TEMPLATE" ]; then MODEL_ARGS+=(--template "$TEMPLATE"); fi
   --torch_dtype bfloat16 \
   --max_length "$MAX_LENGTH" \
   --truncation_strategy "$TRUNC" \
+  --dataset_num_proc "$DATA_PROC" \
+  "${CACHE_ARGS[@]}" \
+  "${DS_ARGS[@]}" \
   --per_device_train_batch_size "$BS" \
   --gradient_accumulation_steps "$GRAD_ACCUM" \
   --learning_rate "$LR" \
   --lr_scheduler_type cosine \
   --warmup_ratio 0.03 \
+  --max_grad_norm "$CLIP" \
+  --seed "$SEED" \
   --max_steps "$MAX_STEPS" \
-  --save_steps "$MAX_STEPS" \
+  --save_steps "$SAVE_STEPS" \
   --logging_steps 10 \
   --optim adamw_torch \
   --gradient_checkpointing true \

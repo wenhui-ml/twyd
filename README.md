@@ -44,6 +44,11 @@ distillation and fold everything back into the *same* dense matrix. No new param
 no runtime changes. Half-size models that keep their teacher's aggregate quality, at a fraction of the
 usual compression budget.
 
+Two mergeable realizations share that recipe: a plain dense weight (**Dense-LRC**) — the default, because
+it is the fastest to train and carries no extra state — and a rank-`k` teacher-spectral variant
+(**CORE-LR**) for tight-memory settings. Both deploy an identical dense matrix; the difference is only
+what the optimizer is allowed to touch during distillation.
+
 ```mermaid
 flowchart LR
     A["deployed student MLP<br/>d_ff x r"] --> B["what LRC trains<br/>col(T): 18.6-37.5%"]
@@ -216,7 +221,7 @@ Three stages, each behind an explicit gate.
 | Stage | Scope | Gate |
 |---|---|---|
 | **V1 · Demonstrated** | Full-MLP LRC (Dense and CORE) on one 8-GPU node, ~10B tokens; plain dense 1.5B–2.7B students | multi-seed replication: headline V1 results hold across seeds |
-| **V1.5 · CORE-LR** | per-layer/per-projection **rank allocator**; **factorized** low-rank execution; target: two consumer GPUs | Qwen2.5-3B→1.7B within **0.5 Avg9** of full CORE at **≤25%** of trainable coordinates |
+| **V1.5 · Efficient full-MLP** | **layer/projection-selective unfreezing** (paper Fig. 8b: the first layers carry the dependence) plus a per-layer **budget allocator**; target: two consumer GPUs. `CORE-LR(k)` is kept as an optional rank-`k` variant and evaluated as an ablation | full-MLP quality at **≤1/3** of the training memory of unfreezing every layer, at matched tokens |
 | **V2 · TWYD-MoE** | router-aware cross-expert compression, Qwen3-30B-A3B first; MoE→MoE (halve server memory) and MoE→Dense (edge chips with poor sparse routing) | expert-level Pareto + merge parity + load balance |
 
 ```mermaid
@@ -225,7 +230,7 @@ gantt
     dateFormat  YYYY-MM-DD
     axisFormat  %b
     section Core research
-    CORE-LR on 2 consumer GPUs      :a1, 2026-11-01, 90d
+    Full-MLP (layer-selective) on 2 GPUs :a1, 2026-11-01, 90d
     Multi-seed replication          :a2, after a1, 45d
     Falcon / Jais public benchmark  :a3, 2027-01-15, 60d
     section MoE
@@ -237,10 +242,31 @@ gantt
     Paid contract or LOI            :c3, 2027-09-01, 90d
 ```
 
-**What V1.5 has to prove (the seed's core technical bet):** a rank-`k` complement with `k ≤ 256`
-recovers the full-CORE result while training **≤25%** of its coordinates, with a measurable step-time or
-optimizer-memory win. On Llama-3B→1.5B that is 143M coordinates vs 660M (21.7%), and the factorized
-forward is already within 1.21× of a dense layer.
+**What V1.5 has to prove (the seed's core technical bet):** opening the complement *selectively* is
+enough. Unfreezing the first ~6 of 28 layers should recover most of the full-MLP gain (the paper's
+knockout shows the first three layers carry nearly all of the functional dependence) while cutting
+trainable state and optimizer memory by ~5× at the same deployed shape. `CORE-LR(k)` is one way to
+shrink that footprint further; it is kept as an ablation, not as the product.
+
+**How V1.5 is built (two weeks, no new hardware):**
+
+| step | what | status / output |
+|---|---|---|
+| 1 | rank layers from the trained full-MLP checkpoint (`scripts/rank_layers.py`): ΔW energy and complement occupancy per layer/projection | ✅ done — 79.1% of ΔW energy is in the complement, flat across depth, so the ranking is *not* a structural signal and the arms are chosen as coverage experiments |
+| 2 | four short arms — `0-5` / `22-27` / `0-2,11-13,25-27` / all-28 — at 5M tokens, matched | ✅ 3 of 4 measured: held-out CE, peak GiB, s/step, optimizer bytes |
+| 3 | take the knee to `seq=2048`, spending the memory that selective unfreezing frees | ✅ measured: `0-5`@2048 peaks at **22.1 GiB** (dense would need ~27) and runs **1.46× more tokens/s** than at 512 |
+| 4 | short SFT + Avg9 for the knee vs the full baseline | the V1.5 gate |
+
+**Measured at 20M tokens (disjoint 258k-token held-out, paired 95% CI):** `0-2,11-13,25-27` (**9 of 28
+layers**) reaches **ΔCE −0.0310** versus **−0.0219** for full-model dense training at the same budget — a
+**+0.0091 nat win** (z = +6.7) — and **ties CORE-LR k=128** (−0.0323, z = −1.4) while using
+**13.25 GiB peak instead of 18.78**, **8.11 s per step instead of 11.8**, **340M trainable instead of 1057M**
+and no basis or rank factor. `0-5` (6 layers) ties dense exactly (−0.0015, z = −0.7) at 12.34 GiB and 227M
+params. At 5M tokens the ordering was the same but compressed (9-layer −0.0221, 6-layer −0.0202, all-28
+−0.0071); the coverage advantage **grows with the budget** (9L − 6L: 0.0019 at 5M → 0.0076 at 20M), so the
+product statement is "spread a small per-layer budget across early + middle + late", not "train the first
+six layers". Selective unfreezing is also ~5% faster per step, not slower.
+
 
 ---
 
@@ -248,7 +274,7 @@ forward is already within 1.21× of a dense layer.
 
 | Moat | Why it compounds | The objection it answers |
 |---|---|---|
-| **Open-core adoption** | Open-source the base TWYD pipeline to build a standard; keep the CORE-LR **rank allocator** and **MoE router alignment** proprietary | "a published method can be copied" |
+| **Open-core adoption** | Open-source the base TWYD pipeline to build a standard; keep the layer/projection **budget allocator** and **MoE router alignment** proprietary | "a published method can be copied" |
 | **Edge delivery experience** | Founder shipped FP8 + vLLM cockpit inference (800 ms → <300 ms) and <10 ms perception on NVIDIA Orin in production | "research that never reaches a device" |
 | **90-day validation plan** | Multi-seed results and a Falcon/Jais compression benchmark published openly within 90 days | "single-seed evidence" |
 | **Low cost to compress** | ~10B distillation tokens today, with a path to two consumer GPUs, keeps delivery cost and pilot price low | "delivery cost and team size" |
@@ -273,7 +299,7 @@ on **cost to compress** and **zero deployment overhead**, not on owning a formul
 inference stack) · regional commercial lead.
 
 **Execution to date:** first-author TWYD paper (arXiv:2609.02006); independent implementation on
-ms-swift; compression results on Llama and Qwen teachers; CORE-LR running end-to-end on consumer GPUs.
+ms-swift; compression results on Llama and Qwen teachers; full-MLP training running end-to-end on consumer GPUs.
 
 ---
 
@@ -290,7 +316,7 @@ Open to a non-dilutive grant with equivalent sovereign compute.
 
 | Months | Milestone |
 |---|---|
-| 1–3 | CORE-LR validated on two consumer GPUs; multi-seed results; open-source release; first Falcon/Jais benchmark |
+| 1–3 | Full-MLP (layer-selective) validated on two consumer GPUs; multi-seed results; open-source release; first Falcon/Jais benchmark |
 | 4–8 | TWYD-MoE on an 8-GPU H100/B300-class node; Qwen3-30B-A3B and a multimodal MoE |
 | 9–12 | 1–2 regional pilots in government, energy or mobility; paid contract or LOI; multimodal edge interaction <300 ms |
 
@@ -306,14 +332,43 @@ technical diligence package: every claim above can be re-run.
 | `plain_lrc` / `dense_lrc` / `core_lrc` tuners + `lrc_distill` loss | ✅ running end-to-end on ms-swift |
 | Step-0 gate (`check_init.py`) | ✅ PASS: 84 CORE-LR modules, **71.6M** trainable, CE 3.181 vs teacher 3.081, top-1 agreement 0.769 |
 | Merge / deployment contract (`check_merge_parity.py`) | ✅ exported weights exact (`max|ΔW| = 0`), zero extra params/FLOPs |
-| CORE-LR factorized forward | ✅ **1.21×** a dense layer per step (vs 3.67× merged rebuild) |
+| CORE-LR factorized forward | ✅ 1.21× a dense *layer* in the microbenchmark, but **1.38× slower end-to-end** at `seq=512` (see ledger) — hence the demotion to ablation |
 | P6 equal-parameter `col(T)` control | ✅ implemented (`TWYD_PERP_BASIS=col`) with a regression test |
 | Rank spectrum + budget tooling | ✅ `measure_complement_rank.py`, `param_budget.py`, `bench_layer_flops.py` |
-| Tests | ✅ **57 passed** (`pytest tests -q`) |
+| Layer-selective unfreezing | ✅ `LORA_LAYERS=0-5` (layers) and `LORA_MODULES=gate_proj,up_proj` (projections), both branches, regression-tested |
+| Layer/projection ranker | ✅ `scripts/rank_layers.py`: ΔW energy + complement occupancy per layer → `LORA_LAYERS` plans |
+| Held-out evaluation | ✅ `scripts/eval_ce.py` (per-chunk CE on a fixed disjoint slice) + `eval_pairwise.py` (paired 95% CI) + `grad_norm_report.py`, `compare_arm_repeats.py` |
+| Data builder | ✅ `scripts/build_fineweb_corpus.py`: `int_score` filter + token budget + `--skip-docs` for provably disjoint appends/holds-outs; `scripts/fineweb_stats.py` for shard inventories |
+| Tests | ✅ **59 passed** (`pytest tests -q`) |
 
-**Currently running:** two matched 20M-token arms on FineWeb-Edu `int_score>=4` (Dense-LRC on one
-7900 XTX, CORE-LR k=128 on the other), to produce the first held-out Pareto point and the complement
-rank spectrum.
+**Currently running:** `0-5` (first 6 layers) at the full 20M-token budget on the second GPU — the
+token-efficiency test against Dense@20M, after `0-5`@5M already tied it on held-out CE.
+
+**Memory ledger at `seq=512` (measured, bf16 + AdamW, same teacher):**
+
+| | Dense-LRC | CORE-LR k=128 |
+|---|---:|---:|
+| trainable weights + grads + AdamW | **7.88 GiB** | **0.53 GiB** (15× less) |
+| frozen basis `U⊥` + `W_col` cache | 0 | **9.26 GiB** |
+| teacher + non-MLP student + activations | 8.63 GiB | 8.99 GiB |
+| **peak** | **17.32 GiB** | **18.78 GiB** |
+| step time | **8.52 s** | 11.78 s |
+
+**Current decision:** CORE-LR is *not* the default. Its 15× optimizer saving is currently offset by
+9.26 GiB of frozen basis, and the rank-`k` factorization slows each step by 1.38×. It stays in the repo
+as an ablation; the product path is **Dense-LRC + layer-selective unfreezing**, which is simpler,
+faster and carries no extra state.
+
+**And the rank hypothesis is now closed by measurement.** The pre-registered test was the complement
+spectrum of the trained checkpoint: `top128_energy` of `Z⊥` came out at **0.204** (stable rank 1083,
+effective rank 1285) against a 0.40 kill threshold. The learned complement is effectively full-rank, so any
+rank-`k` factorization large enough to keep the update is too large to save memory. CORE-LR remains in the
+repo as the paper's ablation row ("why not a low-rank complement") and is off the product and G2 paths.
+
+**First measurement from that checkpoint** (`scripts/rank_layers.py`): **79.1% of the update energy lands
+outside the teacher slice** — `‖ΔW‖_F = 34.50`, of which 27.29 is in `col(T)⊥` — and the share is flat
+across all 28 layers (78.8–79.7%). The optimizer spends most of its budget exactly where plain LRC cannot
+reach, which is the paper's thesis, reproduced at 20M tokens (0.2% of the paper's budget).
 
 **Honest limits:** paper results are single-seed; the auxiliary alignment term here covers hidden states
 on 4 layers (not the full Eq. 7); screening runs use 512-token sequences and a 60M-token corpus, not the
@@ -330,7 +385,8 @@ and all are tracked in the technical docs.
   <img src="docs/figures/core_lr_pipeline.png" alt="CORE-LR pipeline: teacher SVD, frozen column path, rank-k complement, merge, deploy" width="720"/>
 </p>
 
-<p align="center"><sub><b>Figure 2.</b> CORE-LR. The teacher SVD defines a frozen column path and a rank-<code>k</code>
+<p align="center"><sub><b>Figure 2.</b> CORE-LR, the optional rank-<code>k</code> efficiency variant (ablation, not the default).
+The teacher SVD defines a frozen column path and a rank-<code>k</code>
 complement path (<code>B=0</code> at step 0). At export both fold into one dense <code>d_ff x r</code> weight.
 Source: <a href="docs/figures/core_lr_pipeline.tex"><code>docs/figures/core_lr_pipeline.tex</code></a>.</sub></p>
 

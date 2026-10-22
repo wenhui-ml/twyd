@@ -82,6 +82,11 @@ def main() -> int:
                     help="P attention head mapping: select first heads or average groups")
     ap.add_argument("--ridge-perp", default="residual", choices=["zero", "residual", "lowrank"])
     ap.add_argument("--rank-map", default="", help="JSON dict/path: per-module CORE-LR k")
+    ap.add_argument("--lora-layers", default="",
+                    help="e.g. '0-5': only these layers carry the adapter/full-MLP "
+                         "weight; the rest stay frozen plain LRC (layer-selective)")
+    ap.add_argument("--lora-modules", default="",
+                    help="e.g. 'gate_proj,up_proj': only these projections are trainable")
     ap.add_argument("--perp-basis", default="teacher", choices=["teacher", "col"],
                     help="teacher = true complement (CORE/CORE-LR); col = P6 "
                          "equal-parameter control that writes the same number of "
@@ -169,6 +174,8 @@ def main() -> int:
                         rank_map=args.rank_map,
                         factorized=args.factorized,
                         perp_basis=args.perp_basis,
+                        lora_layers=args.lora_layers,
+                        lora_modules=args.lora_modules,
                         target_modules=["gate_proj", "up_proj", "down_proj"])
     cfg.validate()
     meta = _build_factorized_student(student, teacher, cfg, branch=args.branch)
