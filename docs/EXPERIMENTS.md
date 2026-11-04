@@ -60,12 +60,18 @@ above 524M on the same arm, and it saves every ~0.5B tokens so the scaling curve
 | tokens / steps | 2.0B / **15,258** (seq 2048, bs 1, grad-accum 32, 2 cards) |
 | loss | `lrc_distill` (teacher pinned on device) |
 | peak memory | 22.65 GiB |
-| checkpoints | `output/product/pt-2b-band6L/0-2_11-13/*/checkpoint-3815…15258` |
+| step time | ~28 s (teacher forward dominates; both cards at 100%) |
+| checkpoints | every 1,900 steps = 0.25B tokens ≈ 15 h → `output/product/pt-2b-band6L/0-2_11-13/*/checkpoint-1900…15258` |
+
+The first launch used `SAVE_STEPS=3815` (~30 h between checkpoints, nothing on disk for
+a day and a quarter); it was stopped at step 625 and restarted at 15:54 with
+`SAVE_STEPS=1900`, so an eval-able checkpoint lands every ~15 h. The aborted run is
+kept as `output/product/pt-2b-band6L/archived-abort-625steps{,.log}`.
 
 Launch (reproduce):
 
 ```bash
-GPU=0,1 NPROC=2 SEQ=2048 SAVE_STEPS=3815 BS=1 GAS=32 GATE=0 USE_AUX=0 STAGE=pt \
+GPU=0,1 NPROC=2 SEQ=2048 SAVE_STEPS=1900 BS=1 GAS=32 GATE=0 USE_AUX=0 STAGE=pt \
   DATA=$PWD/data/fw_score4_1B.jsonl PLANS=0-2,11-13 LORA_MODULES=gate_proj,up_proj \
   SEED=42 BRANCH=core K=64 LORA_MODE=core FACTORIZED=1 FREEZE_COL=true \
   PERP_BASIS=teacher TOKENS=2000000000 WARM_START=slice \
