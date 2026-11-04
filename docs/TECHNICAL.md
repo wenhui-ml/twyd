@@ -378,6 +378,7 @@ Measured on one RX 7900 XTX (24 GB), Llama-3.2-3B teacher pinned on-device, grad
 | 2–5 min of GPU idle at start | 84 CPU SVDs for the teacher basis | `TWYD_BASIS_CACHE_DIR` content-hash cache: 1.70 s → 0.02 s per projection |
 | CORE-LR slower than dense | rebuilding `basis_col @ z_col.T` every forward | `FACTORIZED=1` (1.21× dense per layer) |
 | attention OOM at 2048 | math/eager SDPA materializes `S×S` | SDPA + AOTriton (`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`) |
+| OOM at 23.19 GiB *before* step 1, insensitive to `max_length`/`grad_accum` | complement basis `U⊥` built for **every** MLP module (84 × ≈109 MB ≈ 9 GiB) even when `LORA_LAYERS` selects 6 | lazy basis: build it only for modules that will train (`in_lora_set and with_perp`), `left` and `right` paths |
 
 Single-layer cost at `seq=512` (`scripts/bench_layer_flops.py`, H=2048, d_ff=8192, r=512, k=128):
 
@@ -410,6 +411,13 @@ The 15× optimizer saving is more than offset by 9.26 GiB of frozen basis and ca
 24 GB cards the actionable memory knob is therefore **which layers are unfrozen** (`LORA_LAYERS`), not a
 rank factorization; dense at `seq=1024` peaks at 23.2 GiB (too close to the limit), CORE-LR fits but
 pays the basis.
+
+**That 6.55 GiB of `U⊥` used to be paid on every layer, not just the planned ones.** The complement
+basis was materialised inside the per-module loop before the `LORA_LAYERS`/`LORA_MODULES` filter was
+applied, so a 6-layer plan still built ~9 GiB of bases for all 84 MLP modules and the SFT stage died at
+23.19 GiB before its first step — reducing `max_length` or raising `grad_accum` changed nothing because
+the allocation is fixed. Bases are now built lazily (`in_lora_set and with_perp`), which makes peak
+memory proportional to the plan, not to the model.
 
 Throughput (single card, `seq=512`, 16,384 tokens/step): dense ≈ 1.8k tok/s (8.98 s/step), CORE-LR
 ≈ 2.5k tok/s. Full-CORE `K=0` has no factorized forward yet, so every step rebuilds `d_ff×r` and runs

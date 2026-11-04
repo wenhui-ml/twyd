@@ -165,19 +165,35 @@ fi
 MODEL_ARGS=()
 if [ -n "$MODEL_TYPE" ]; then MODEL_ARGS+=(--model_type "$MODEL_TYPE"); fi
 if [ -n "$TEMPLATE" ]; then MODEL_ARGS+=(--template "$TEMPLATE"); fi
+# LOSS_TYPE="" omits --loss_type entirely (swift default = standard cross-entropy,
+# which is what the paper's SFT stage uses; "lrc_distill" is the PT loss).
+LOSS_TYPE_DEF=${LOSS_TYPE-lrc_distill}
+LOSS_ARGS=()
+if [ -n "$LOSS_TYPE_DEF" ]; then LOSS_ARGS+=(--loss_type "$LOSS_TYPE_DEF"); fi
 CACHE_ARGS=()
 if [ "$DATA_CACHE" = "true" ]; then CACHE_ARGS+=(--load_from_cache_file true); fi
 DS_ARGS=()
 if [ -n "${DS:-}" ]; then DS_ARGS+=(--deepspeed "$DS"); fi
 if [ "${RESUME:-0}" = "1" ]; then DS_ARGS+=(--resume_from_checkpoint True); fi
 if [ "${NPROC:-1}" -gt 1 ]; then export NPROC_PER_NODE="${NPROC}"; fi
+# DDP broadcasts every registered buffer before each forward by default.  The TWYD
+# linear layers register their frozen bases (basis_col / basis_perp = GBs of CPU
+# buffers), which the NCCL group cannot broadcast:
+#   RuntimeError: No backend type associated with device type cpu
+# (seen 2026-10-29 on the CORE-LR 9-layer arm at step 2).  Those bases are a
+# deterministic function of the teacher and identical on every rank, so they never
+# need syncing; DDP_BROADCAST_BUFFERS=true restores the default.
+DDP_ARGS=()
+if [ "${NPROC:-1}" -gt 1 ] && [ "${DDP_BROADCAST_BUFFERS:-false}" != "true" ]; then
+  DDP_ARGS+=(--ddp_broadcast_buffers false)
+fi
 
 "$SWIFT" "$STAGE" \
   --model "$MODEL" \
   "${MODEL_ARGS[@]}" \
-  --dataset "$DATASET" \
+  --dataset $DATASET \
   --tuner_type "${BRANCH}_lrc" \
-  --loss_type lrc_distill \
+  "${LOSS_ARGS[@]}" \
   --attn_impl "$ATTN_IMPL" \
   --external_plugins /home/chenwh/Papers/twyd/twyd_plugin.py \
   --torch_dtype bfloat16 \
@@ -186,6 +202,7 @@ if [ "${NPROC:-1}" -gt 1 ]; then export NPROC_PER_NODE="${NPROC}"; fi
   --dataset_num_proc "$DATA_PROC" \
   "${CACHE_ARGS[@]}" \
   "${DS_ARGS[@]}" \
+  "${DDP_ARGS[@]}" \
   --per_device_train_batch_size "$BS" \
   --gradient_accumulation_steps "$GRAD_ACCUM" \
   --learning_rate "$LR" \
@@ -199,7 +216,7 @@ if [ "${NPROC:-1}" -gt 1 ]; then export NPROC_PER_NODE="${NPROC}"; fi
   --optim adamw_torch \
   --gradient_checkpointing true \
   --output_dir "$OUT" \
-  --dataloader_num_workers 0 \
+  --dataloader_num_workers "${DATALOADER_WORKERS:-0}" \
   --remove_unused_columns false \
   2>&1 | tee "$OUT/training.log"
 

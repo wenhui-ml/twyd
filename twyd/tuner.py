@@ -539,6 +539,53 @@ class _TwydWrapper(nn.Module):
         return self.student.save_pretrained(*a, **k)
 
 
+def _pt_ckpt_action(cfg, pt_ckpt):
+    """Decide what a ``warm_start=pt_ckpt`` request must do, and fail loudly if it cannot.
+
+    Regression guard (2026-10-29).  The load used to be gated on
+    ``cfg.stage == "sft"``, so a *PT* continuation that asked for a checkpoint warm
+    start printed nothing and silently restarted from the slice init; ~44 GPU-hours
+    went into runs that were not the continuations they claimed to be.  Keeping the
+    decision in a pure function makes that class of bug testable without a model.
+
+    Returns ``"load"`` or ``"ignore"``; raises ValueError on a request we cannot honour.
+    """
+    if getattr(cfg, "warm_start", "") != "pt_ckpt":
+        return "ignore"
+    if not pt_ckpt:
+        raise ValueError(
+            "WARM_START=pt_ckpt was requested but PT_CKPT is empty; refusing to guess "
+            "which checkpoint to continue from")
+    stage = getattr(cfg, "stage", "pt")
+    if stage not in ("pt", "sft"):
+        raise ValueError(f"WARM_START=pt_ckpt is undefined for stage={stage!r}")
+    return "load"
+
+
+def _apply_pt_ckpt_(student: nn.Module, pt_ckpt: str, stage: str, strict: bool = True) -> int:
+    """Load a merged PT checkpoint into the student; never skip silently.
+
+    ``strict`` (the default, also the default of ``TWYD_PT_CKPT_STRICT``) turns a failed
+    load into an error.  A soft fallback here would mean a "continuation" that silently
+    restarts from the slice init -- visible only in the loss curve.
+    """
+    try:
+        n = _load_pt_merged_(student, pt_ckpt)
+        err = None
+    except Exception as e:                                  # noqa: BLE001
+        n, err = 0, e
+    if n <= 0:
+        why = f" ({err})" if err else " -- wrong path, or no tensor shapes match the student"
+        msg = f"WARM_START=pt_ckpt loaded 0 tensors from {pt_ckpt}{why}"
+        if strict:
+            raise RuntimeError(
+                msg + "; set TWYD_PT_CKPT_STRICT=0 to accept the slice-init fallback instead")
+        print(f"[twyd] {msg}; falling back to slice init")
+        return 0
+    print(f"[twyd] {str(stage).upper()} warm start: loaded {n} tensors from PT ckpt {pt_ckpt}")
+    return n
+
+
 def _load_pt_merged_(student: nn.Module, pt_ckpt: str) -> int:
     """Load a merged PT checkpoint into the student before factorized rebuild.
 
@@ -713,11 +760,16 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                             new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
                     T, P = build_core_basis(t_weight, "left")
-                    P = _completion_basis(T, P, "left", perp_basis, mod_name)
+                    # Only materialise the complement basis for modules that will actually
+                    # train. It is ~109 MB per module, so building it for all 84 MLP
+                    # modules costs ~9 GB of dead weight (this is what made the SFT
+                    # stage OOM on 24 GB cards, 2026-11-03).
+                    P = (_completion_basis(T, P, "left", perp_basis, mod_name)
+                         if (in_lora_set and with_perp) else None)
                     Z_col = (T.T @ s_w).T.contiguous()
                     W0 = (T @ Z_col.T).contiguous()  # merged plain weight d_ff x r
                     Z_perp_init = None
-                    if with_perp and preserve_perp:
+                    if with_perp and preserve_perp and P is not None:
                         Z_perp_init = (P.T @ (s_w - T @ Z_col.T)).T.contiguous()
                     use_core_lora = bool(use_lora_here and lora_mode == "core" and with_perp)
                     if not in_lora_set:
@@ -777,11 +829,12 @@ def _build_factorized_student(student: nn.Module, teacher: nn.Module, cfg,
                             new_mod.weight.copy_(W0.to(new_mod.weight.dtype))
                 else:
                     R, Vp = build_core_basis(t_weight, "right")
-                    Vp = _completion_basis(R, Vp, "right", perp_basis, mod_name)
+                    Vp = (_completion_basis(R, Vp, "right", perp_basis, mod_name)
+                          if (in_lora_set and with_perp) else None)
                     Z_col = (s_w @ R.T).contiguous()
                     W0 = (Z_col @ R).contiguous()  # merged plain weight r x d_ff
                     Z_perp_init = None
-                    if with_perp and preserve_perp:
+                    if with_perp and preserve_perp and Vp is not None:
                         Z_perp_init = ((s_w - Z_col @ R) @ Vp.T).contiguous()
                     use_core_lora = bool(use_lora_here and lora_mode == "core" and with_perp)
                     if not in_lora_set:
@@ -1252,16 +1305,15 @@ def _prepare_model_impl(args, model, branch: str):
         except Exception as e:
             print(f"[twyd] master P projection failed ({e}); keeping slice init")
             master_P = None
-    # SFT warm start: load merged PT ckpt into the (possibly shrunk) student
-    # BEFORE factorized rebuild, so Z_col/W0 inherit PT-learned weights
-    # instead of the raw slice init. Teacher for SFT stays the open teacher.
+    # PT / SFT warm start: load merged PT ckpt into the (possibly shrunk) student
+    # BEFORE factorized rebuild, so Z_col/W0 inherit PT-learned weights instead of
+    # the raw slice init.  The decision (and the hard failure) lives in
+    # _pt_ckpt_action / _apply_pt_ckpt_ so that a PT continuation can never silently
+    # restart from the init -- see the 2026-10-29 note on those helpers.
     pt_ckpt = kw.get("pt_ckpt", None)
-    if cfg.stage == "sft" and cfg.warm_start == "pt_ckpt" and pt_ckpt:
-        try:
-            n = _load_pt_merged_(student, pt_ckpt)
-            print(f"[twyd] SFT warm start: loaded {n} tensors from PT ckpt {pt_ckpt}")
-        except Exception as e:
-            print(f"[twyd] SFT warm start failed ({e}); falling back to slice init")
+    if _pt_ckpt_action(cfg, pt_ckpt) == "load":
+        _apply_pt_ckpt_(student, pt_ckpt, cfg.stage,
+                        strict=os.environ.get("TWYD_PT_CKPT_STRICT", "1") != "0")
     # Offline ridge checkpoint: a merged HF dir or a .pt {"weights": {...}}.
     # Load BEFORE factorization so Z_col/Z_perp are rebuilt from the ridge W.
     ridge_ckpt = kw.get("ridge_ckpt", None)

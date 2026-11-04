@@ -12,6 +12,11 @@ import torch.nn.functional as F
 
 _PROF = {"n": 0, "t_fwd": 0.0, "t_teacher": 0.0, "t_kl": 0.0, "t_aux": 0.0,
          "t_ce": 0.0}
+# The composite loss is CE + T^2*KL with T=40, so the KL term (~178) swamps CE (~2.5):
+# a 1% CE improvement moves the number by 0.03 and looks like "no learning". Print the
+# two components every `TWYD_LOG_EVERY` micro-batches (default 320 = 10 steps at gas=32)
+# so progress is visible at all.
+_CALLS = {"n": 0}
 
 
 def fit_hidden_projection(A: torch.Tensor, B: torch.Tensor, max_rows: int = 1024):
@@ -311,4 +316,19 @@ class LrcDistillLoss(_BaseLoss):
                       f"ce={_PROF['t_ce'] / n * 1e3:.0f}ms "
                       f"loss_total={_PROF['t_fwd'] / n * 1e3:.0f}ms "
                       f"(teacher+kl+ce are inside loss_total)", flush=True)
+        # Component logging: the number the trainer prints is CE + T^2*KL, which is
+        # dominated by KL. Print both so "loss looks flat" can be read correctly.
+        _CALLS["n"] += 1
+        every = int(os.environ.get("TWYD_LOG_EVERY", 320) or 320)
+        if every > 0 and _CALLS["n"] % every == 0 and ntp is not None:
+            try:
+                _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            except Exception:
+                _rank = 0
+            if _rank == 0:
+                _kl = float(kl) if kl is not None else float("nan")
+                # `kl` already carries the T^2 factor from _per_pos_kl, so do NOT
+                # multiply again; report the raw nats too for interpretability.
+                print(f"[twyd] ce={float(ntp):.4f} kl_raw={_kl / (T * T):.6f} "
+                      f"klT2={wKL * _kl:.2f} loss={float(loss):.2f}", flush=True)
         return loss

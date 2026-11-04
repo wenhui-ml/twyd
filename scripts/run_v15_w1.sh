@@ -23,6 +23,11 @@ CLIP=${CLIP:-1.0}          # max_grad_norm; 10 silences the "everything is clipp
 SEED=${SEED:-42}
 NPROC=${NPROC:-1}          # >1 = single job across N cards (swift reads NPROC_PER_NODE)
 DS=${DS:-}                 # e.g. zero2_offload -- needed for the full 28L arm at seq=2048
+STAGE=${STAGE:-pt}         # pt | sft
+WARM_START=${WARM_START:-base}   # base | slice | pt_ckpt | ridge_ckpt
+PT_CKPT=${PT_CKPT:-}       # WARM_START=pt_ckpt needs this
+RESUME=${RESUME:-0}        # 1 = continue from the newest checkpoint in OUTROOT
+TRUNC=${TRUNC:-split}      # split = PT only; SFT must use delete/right
 BRANCH=${BRANCH:-dense}    # dense | core (with K=k)
 K=${K:-0}
 LORA_MODE=${LORA_MODE:-dense}   # dense arm = dense; CORE-LR arm = core
@@ -101,13 +106,14 @@ for plan in $PLANS; do
       continue
     fi
     CUDA_VISIBLE_DEVICES="$GPU" \
-    GATE="${GATE:-1}" GATE_SEQ_LEN=64 USE_AUX=0 STAGE=pt BRANCH="$BRANCH" K="$K" \
+    GATE="${GATE:-1}" GATE_SEQ_LEN=64 USE_AUX=0 STAGE="$STAGE" BRANCH="$BRANCH" K="$K" \
     LORA_MODE="$LORA_MODE" FACTORIZED="$FACTORIZED" LORA_LAYERS="$plan_arg" LORA_MODULES="${LORA_MODULES:-}" \
     NPROC="$NPROC" DS="$DS" \
-    BS="$BS" MAX_LENGTH="$SEQ" GRAD_ACCUM="$GAS" TRUNC=split MAX_STEPS="$STEPS" LR="$LR" \
+    BS="$BS" MAX_LENGTH="$SEQ" GRAD_ACCUM="$GAS" TRUNC="$TRUNC" MAX_STEPS="$STEPS" LR="$LR" \
     CLIP="$CLIP" SEED="$SEED" \
     DATASET="$DATA" MODEL="$MODEL" TEACHER="$TEACHER" \
-    MODEL_TYPE=llama TEMPLATE=llama3_2 WARM_START=base OUT="$rep_out" \
+    MODEL_TYPE=llama TEMPLATE=llama3_2 WARM_START="$WARM_START" PT_CKPT="$PT_CKPT" \
+    RESUME="$RESUME" OUT="$rep_out" \
     bash "$ROOT/scripts/train_core_lr_pilot.sh" > "$rep_out.log" 2>&1
     echo "    rc=$? log=$rep_out.log"
   done

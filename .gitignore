@@ -11,3 +11,5 @@ twyd.egg-info/
 *.synctex.gz
 *.fls
 *.fdb_latexmk
+
+nohup.out

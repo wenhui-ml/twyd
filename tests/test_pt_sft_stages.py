@@ -190,3 +190,56 @@ def test_sft_warm_start_loads_pt_merged(tmp_path):
     _freeze_for_branch(w, cfg)
     sd = merged_state_dict(w)
     assert torch.isfinite(sd["gate_proj.weight"]).all()
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-29 regression: a PT continuation must load its checkpoint.
+# The load was gated on `stage == "sft"`, so `warm_start=pt_ckpt` at stage=pt
+# silently restarted from the slice init (~44 GPU-hours of runs that were not the
+# continuations they claimed to be).
+# ---------------------------------------------------------------------------
+def test_pt_ckpt_gate_loads_for_both_stages():
+    from twyd.tuner import _pt_ckpt_action
+    for stage in ("pt", "sft"):
+        cfg = TwydLRCConfig(branch="dense", student_hidden=12, stage=stage,
+                            warm_start="pt_ckpt")
+        assert _pt_ckpt_action(cfg, "/tmp/some/ckpt") == "load", stage
+
+
+def test_pt_ckpt_gate_rejects_empty_path():
+    import pytest
+    from twyd.tuner import _pt_ckpt_action
+    cfg = TwydLRCConfig(branch="dense", student_hidden=12, stage="pt", warm_start="pt_ckpt")
+    with pytest.raises(ValueError):
+        _pt_ckpt_action(cfg, "")
+
+
+def test_pt_ckpt_gate_ignores_other_warm_starts():
+    from twyd.tuner import _pt_ckpt_action
+    cfg = TwydLRCConfig(branch="dense", student_hidden=12, stage="pt", warm_start="slice")
+    assert _pt_ckpt_action(cfg, "") == "ignore"
+
+
+def test_pt_ckpt_load_is_strict_on_zero_tensors(tmp_path):
+    """_load_pt_merged_ returns 0 for a missing file; that must raise, not fall back."""
+    import pytest
+    from twyd.tuner import _apply_pt_ckpt_
+    _, student = _fake_pair()
+    with pytest.raises(RuntimeError):
+        _apply_pt_ckpt_(student, str(tmp_path), "pt", strict=True)
+    assert _apply_pt_ckpt_(student, str(tmp_path), "pt", strict=False) == 0
+
+
+def test_pt_ckpt_load_is_strict_on_exception(tmp_path, monkeypatch):
+    import pytest
+    import twyd.tuner as T
+
+    def boom(student, path):
+        raise OSError("unreadable shard")
+
+    monkeypatch.setattr(T, "_load_pt_merged_", boom)
+    _, student = _fake_pair()
+    with pytest.raises(RuntimeError) as ei:
+        T._apply_pt_ckpt_(student, str(tmp_path), "pt", strict=True)
+    assert "unreadable shard" in str(ei.value)
+    assert T._apply_pt_ckpt_(student, str(tmp_path), "pt", strict=False) == 0

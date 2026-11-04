@@ -1,40 +1,42 @@
 #!/usr/bin/env python
-"""Compact status dashboard for a TWYD training run (works on any ms-swift run dir).
+"""Precise status for a TWYD run: watch CE, not the composite loss.
 
-Reads the structured `logging.jsonl` that swift writes every `logging_steps`, so it
-does not have to parse the tqdm bars.
+The trainer's loss is `CE + T^2 * KL` (T=40, so the KL term is ~179 while CE is ~2.5).
+A 1% CE improvement therefore moves the printed loss by 0.03 and looks like "no learning".
+`twyd/loss.py` prints the components every 10 steps:
 
-  python scripts/watch_training.py                                   # newest run under output/
-  python scripts/watch_training.py output/formal-b/full-28L/all     # a specific run dir
-  python scripts/watch_training.py --follow 60                       # refresh every 60 s
-  python scripts/watch_training.py --tail 5                          # also show raw log lines
+    [twyd] ce=2.4566 kl_raw=0.000208 klT2=0.33 loss=2.62
 
-What is "healthy" (established on this project):
-  * s/step flat (±5%) after the first ~20 steps
-  * token_acc rising, then flat near the data's ceiling (~0.474 on FineWeb-Edu)
-  * grad_norm staying in the same decade (median ~60-80 for full-model, ~5-20 for 1-2 layers)
-  * peak memory flat, not creeping
-  * loss: only the *relative* slope is meaningful across configs -- `loss = CE + T^2 * KL`
-    with T=40, so the value is dominated by the KL term and is not comparable across
-    sequence lengths.
+This tool pairs those lines with the tqdm step counter, so you get a real CE curve plus
+speed / ETA / VRAM / grad_norm / checkpoints, and it flags a stalled log.
+
+  python scripts/watch_training.py                              # newest run
+  python scripts/watch_training.py output/formal-b/slice-full    # one arm
+  python scripts/watch_training.py --follow 60                   # refresh every 60 s
+  python scripts/watch_training.py --eval-hint                    # print held-out eval cmd
+
+`kl_raw` tells you the regime: ~2e-4 right after a teacher slice (readable, lots of
+headroom) vs 0.1+ when continuing from the released base (saturated, little headroom).
 """
 import argparse
 import glob
 import json
 import os
+import re
 import time
 
+TQDM_RE = re.compile(r"Train:\s+\d+%\|[^|]*\|\s*(\d+)/(\d+)")
+CE_RE = re.compile(r"\[twyd\] ce=([\d.]+) kl_raw=([\d.eE+-]+) klT2=([\d.]+) loss=([\d.]+)")
 
-def find_runs(explicit):
-    if explicit:
-        return [explicit.rstrip("/")]
-    cands = [os.path.dirname(p) for p in glob.glob("output/**/logging.jsonl", recursive=True)]
-    return sorted(cands, key=lambda d: os.path.getmtime(os.path.join(d, "logging.jsonl")),
-                  reverse=True)[:6]
+
+def human(sec):
+    if sec != sec or sec in (float("inf"), float("-inf")):
+        return "?"
+    sec = int(max(sec, 0))
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
 
 
 def resolve(run):
-    """Accept an arm dir, a tag dir or a version dir; return the version dir with the log."""
     run = run.rstrip("/")
     if os.path.exists(os.path.join(run, "logging.jsonl")):
         return run
@@ -45,102 +47,146 @@ def resolve(run):
     return run
 
 
-def load_steps(run):
-    path = os.path.join(run, "logging.jsonl")
+def find_runs(explicit):
+    if explicit:
+        return [explicit]
+    cands = [os.path.dirname(p) for p in glob.glob("output/**/logging.jsonl", recursive=True)]
+    return sorted(cands, key=lambda d: os.path.getmtime(os.path.join(d, "logging.jsonl")),
+                  reverse=True)[:6]
+
+
+def load_steps(vdir):
+    path = os.path.join(vdir, "logging.jsonl")
     if not os.path.exists(path):
-        return [], []
+        return []
     rows = [json.loads(l) for l in open(path)]
-    return [r for r in rows if "loss" in r], rows
+    return [r for r in rows if "loss" in r]
 
 
-def human(sec):
-    if sec != sec or sec in (float("inf"), float("-inf")):
-        return "?"
-    sec = int(max(sec, 0))
-    return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+def parse_ce_curve(logpath):
+    """[(step, ce, kl_raw, loss)] from the interleaved tqdm/print stream."""
+    if not os.path.exists(logpath):
+        return []
+    with open(logpath, "rb") as f:
+        raw = f.read().decode("utf-8", "ignore")
+    out, cur = [], 0
+    for tok in re.split(r"[\r\n]", raw):
+        m = TQDM_RE.search(tok)
+        if m:
+            cur = int(m.group(1))
+        m = CE_RE.search(tok)
+        if m:
+            out.append((cur, float(m.group(1)), float(m.group(2)), float(m.group(4))))
+    return out
 
 
-def report(run, tail=0):
-    run = resolve(run)
-    steps, rows = load_steps(run)
-    name = run
-    if not steps:
-        print(f"{name}\n  no step logged yet (still loading / encoding the dataset)")
-        return None
-    last = steps[-1]
-    cur, total = (last["global_step/max_steps"].split("/") + ["?"])[:2]
-    cur_i = int(cur)
-    tot_i = int(total) if total.isdigit() else 0
+def ema(vals, alpha=0.15):
+    if not vals:
+        return float("nan")
+    e = vals[0]
+    for v in vals[1:]:
+        e = alpha * v + (1 - alpha) * e
+    return e
 
-    # instantaneous rate from the last two logged points
-    rate = float("nan")
-    if len(steps) >= 2:
+
+def slope(points, tail=None):
+    pts = points[-tail:] if tail else points
+    if len(pts) < 3:
+        return float("nan")
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    if den == 0:
+        return float("nan")
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+
+
+def report(arm, tail_n=8, eval_hint=False):
+    vdir = resolve(arm)
+    log = os.path.normpath(os.path.join(vdir, "..")) + ".log"
+    if not os.path.exists(log):
+        log = os.path.normpath(os.path.join(vdir, "..", "..")) + ".log"
+    steps = load_steps(vdir)
+    curve = parse_ce_curve(log)
+
+    print(f"{vdir}")
+    if steps:
+        last = steps[-1]
+        cur, total = (last["global_step/max_steps"].split("/") + ["?"])[:2]
         rate = float(last.get("train_speed(s/it)", float("nan")))
-    loss = [r["loss"] for r in steps]
-    acc = [r.get("token_acc", float("nan")) for r in steps]
-    gn = [r.get("grad_norm") for r in steps if r.get("grad_norm") is not None]
-    mem = max((r.get("memory(GiB)", 0) or 0) for r in steps)
+        pct = 100.0 * int(cur) / int(total) if total.isdigit() and int(total) else 0.0
+        print(f"  step      {cur}/{total} ({pct:.1f}%)   elapsed {last.get('elapsed_time', '?')}")
+        if rate == rate:
+            print(f"  speed     {rate:.2f} s/step   ETA {human((int(total) - int(cur)) * rate)}")
+        gns = [r["grad_norm"] for r in steps if r.get("grad_norm") is not None]
+        if gns:
+            s = sorted(gns)
+            print(f"  grad_norm median {s[len(s) // 2]:.1f}   max {max(gns):.1f}")
+        mem = max((r.get("memory(GiB)") or 0) for r in steps)
+        print(f"  peak mem  {mem:.2f} GiB (reserved)")
+        print(f"  acc       {last.get('token_acc', 0):.4f}")
+        print(f"  loss      {last['loss']:.2f}  <- CE + T^2*KL; read the CE line below instead")
+    else:
+        print("  (no step logged yet -- dataset encoding / model load)")
 
-    print(f"{name}")
-    pct = 100.0 * cur_i / tot_i if tot_i else 0.0
-    print(f"  step      {cur}/{total}  ({pct:.1f}%)   elapsed {last.get('elapsed_time', '?')}")
-    if tot_i and cur_i and rate == rate:
-        print(f"  speed     {rate:.2f} s/step    ETA {human((tot_i - cur_i) * rate)}"
-              f"   step {cur_i}/{tot_i}")
-    print(f"  loss      last {loss[-1]:8.2f}   first {loss[0]:8.2f}   min {min(loss):8.2f}"
-          f"   mean5 {sum(loss[-5:]) / len(loss[-5:]):8.2f}   d={100 * (loss[-1] / loss[0] - 1):+.1f}%")
-    if acc and acc[-1] == acc[-1]:
-        print(f"  token_acc last {acc[-1]:.4f}   max {max(a for a in acc if a == a):.4f}")
-    if gn:
-        gn_sorted = sorted(gn)
-        print(f"  grad_norm median {gn_sorted[len(gn_sorted) // 2]:.1f}   max {max(gn):.1f}")
-    print(f"  peak mem  {mem:.2f} GiB")
-    ckpts = sorted(glob.glob(os.path.join(run, "checkpoint-*")) +
-                   glob.glob(os.path.join(run, "*", "v*", "checkpoint-*")))
-    if ckpts:
-        print("  ckpt      " + ", ".join(os.path.basename(c) for c in ckpts[-4:]))
+    if curve:
+        ce = [c[1] for c in curve]
+        print(f"  CE        last {ce[-1]:.4f}   ema {ema(ce):.4f}   min {min(ce):.4f}   n={len(ce)}")
+        print(f"  CE slope  per 1k steps: all {slope(curve) * 1000:+.4f}   "
+              f"last{tail_n} {slope(curve, tail_n) * 1000:+.4f}   (negative = learning)")
+        kr = curve[-1][2]
+        regime = ("teacher-slice regime (readable, lots of headroom)" if kr < 1e-3
+                  else "continued-from-base regime (saturated, little headroom)")
+        print(f"  kl_raw    {kr:.6f}  -> {regime}")
+        for st, c, k, lo in curve[-min(6, len(curve)):]:
+            print(f"    step {st:>6}  ce {c:.4f}  kl_raw {k:.6f}  loss {lo:.2f}")
+    else:
+        print("  CE        (no [twyd] ce= lines: this run started before the component")
+        print("             logging patch of 2026-10-23 09:30, or the log path is wrong)")
 
-    # staleness / crash detection: compare the last log line's mtime with its own rate
-    path = os.path.join(run, "logging.jsonl")
-    idle = time.time() - os.path.getmtime(path)
-    if rate == rate and idle > max(300, 6 * rate):
-        print(f"  !! no new log line for {human(idle)} -- stalled or crashed? "
-              f"(check {run.replace('/logging.jsonl', '')}.log)")
-    if tail:
-        log = os.path.join(run, "..", "..", ".log")
-        log = os.path.normpath(os.path.join(run, "..")) + ".log"
-        if os.path.exists(log):
-            print("  --- last log lines")
-            with open(log, "rb") as f:
-                f.seek(max(0, os.path.getsize(log) - 4000))
-                chunk = f.read().decode("utf-8", "ignore").replace("\r", "\n")
-            for line in [x for x in chunk.split("\n") if x.strip()][-tail:]:
-                print("   ", line[:160])
-    return steps
+    ck = sorted(glob.glob(os.path.join(vdir, "checkpoint-*")))
+    if ck:
+        print(f"  ckpt      {', '.join(os.path.basename(c) for c in ck[-3:])}")
+        if eval_hint:
+            print("  held-out CE for the newest ckpt (needs ~7 GiB free VRAM):")
+            print(f"    CUDA_VISIBLE_DEVICES=0 python scripts/eval_ce.py "
+                  f"--data data/fineweb_edu_holdout.jsonl")
+            print(f"      --models /home/chenwh/models/LRC-1.5B-Base {ck[-1]} "
+                  f"--seq-len 512 --max-docs 600")
+
+    logf = os.path.join(vdir, "logging.jsonl")
+    if os.path.exists(logf) and steps:
+        idle = time.time() - os.path.getmtime(logf)
+        rate = float(steps[-1].get("train_speed(s/it)", 30))
+        if idle > max(300, 6 * rate):
+            print(f"  !! no new log for {human(idle)} -- stalled/crashed? check {log}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("run", nargs="?", default=None, help="run dir (default: newest under output/)")
-    ap.add_argument("--follow", type=int, default=0, metavar="SEC", help="refresh every SEC seconds")
-    ap.add_argument("--tail", type=int, default=0, help="also print the last N raw log lines")
+    ap.add_argument("run", nargs="?", default=None)
+    ap.add_argument("--follow", type=int, default=0, metavar="SEC")
+    ap.add_argument("--points", type=int, default=8, help="window for the tail CE slope")
+    ap.add_argument("--eval-hint", action="store_true")
     args = ap.parse_args()
 
     while True:
         runs = find_runs(args.run)
         if not runs:
-            print("no run dir with logging.jsonl found under output/")
+            print("no run dir with logging.jsonl under output/")
             return
         for i, r in enumerate(runs):
             if i:
                 print()
-            report(r, tail=args.tail if i == 0 else 0)
+            report(r, args.points, args.eval_hint if i == 0 else False)
         if not args.follow:
             return
-        print(f"\n(refreshing every {args.follow}s -- Ctrl-C to stop)")
+        print(f"\n(refresh {args.follow}s, Ctrl-C to stop)")
         time.sleep(args.follow)
         print("\033[2J\033[H", end="")
 
 
 if __name__ == "__main__":
     main()
+
