@@ -99,6 +99,53 @@ Then the SFT stage on top, with the recipe from §1 (`PT_CKPT=<ckpt>`,
 
 | symptom | root cause | fix |
 |---|---|---|
+## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
+
+`§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
+44.8M trainable params is no better than our 5.11M-param CORE-LR arm. Both facts
+point at the same constraint, and it is not the adapter or the token budget:
+
+| arm (same paper-8 suite, same harness) | width | trainable | Avg8 | MMLU |
+|---|---:|---:|---:|---:|
+| teacher `Llama-3.2-3B-Instruct` | 3072 | – | **.7135** | **.6222** |
+| CORE-LR k=64, 524M tok | 1536 | 5.11M | .6633 | .4999 |
+| CORE-LR k=64 + SFT | 1536 | 5.11M | .6693 | .4969 |
+| LoRA r=256, 9 layers, 524M tok | 1536 | **44.83M** | .6611 | .4947 |
+| `LRC-1.5B-Base` (paper release) | 1536 | – | .6550 | .5006 |
+
+Giving the adapter **8.8×** more parameters changed nothing, so the ceiling is the
+student, not the update. The mechanism is **rank, not non-linearity**:
+
+* SiLU/GELU is element-wise — a 1536-wide model is just as non-linear as a 3072-wide one.
+* Every layer's MLP composite `W_down · W_up` has rank ≤ `min(d_hidden, d_ff)`: 3072
+  for the teacher, **1536** for the student. The residual stream is the inter-layer
+  bus, and its width halves with it.
+* Width reduction is a **projection**: the discarded directions cannot be written
+  back by any amount of training (data-processing inequality). LoRA never projects —
+  `W = W₀(full rank) + BA` is a *superset* of the original model, which is exactly
+  why LoRA can match or beat a teacher that it literally contains.
+
+That also explains the CE/MMLU split we measure: the slice keeps the high-variance
+principal subspace (next-token prediction is dominated by frequent patterns — CE
+2.4318–2.4437 is *better* than `LRC-1.5B-Base`'s 2.4771) and drops the low-variance
+long tail where specific facts live (MMLU −12 pt). **Lower CE does not mean the
+knowledge survived.**
+
+**Measurement (`scripts/export_slice.py`).** The zero-training slice init is
+exported at several widths and scored on the same suite; every point costs no
+training, only an eval:
+
+```bash
+python scripts/export_slice.py --r 2048 --out output/slices/r2048
+PRESET=paper GPU=0 BATCH=16 bash scripts/run_lm_eval.sh output/slices/r2048 paper_r2048
+```
+
+Widths under test: 768 / 1024 / 1536 / 2048 / 2560 (3072 = the teacher itself).
+If MMLU rises monotonically with `r` while the 8-task behaviour tasks saturate
+early, then "half the parameters" must be bought by **pruning depth at full width**,
+not by halving the residual stream — and the SFT-only path can only repair what the
+projection left behind.
+
 | OOM at 23.19 GiB, *before* the first step, insensitive to `MAX_LENGTH` | complement basis `U⊥` materialised for **every** MLP module (84 × ≈109 MB ≈ 9 GiB) although `LORA_LAYERS` selected 6 | build it lazily — only for modules that will train (`in_lora_set and with_perp`), both `left` and `right` paths (`twyd/tuner.py`) |
 | `KeyError: 'nll'` when switching the SFT loss | `nll` is not a registered `--loss_type` | `LOSS_TYPE=` (empty) omits the flag → swift default cross-entropy, which is what the paper's SFT uses |
 | teacher resident during SFT | distillation loss is a PT objective | `TWYD_TEACHER_DEVICE=cpu` + no `--loss_type` for SFT |
