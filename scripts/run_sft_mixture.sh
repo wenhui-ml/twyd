@@ -28,8 +28,19 @@ mkdir -p "$OUT"
 echo "=== SFT stage: preflight=$PRE tokens=$TOKENS lr=$LR pt_ckpt=$PT"
 echo "=== out=$OUT"
 
-env GPU=0,1 NPROC=2 MAX_LENGTH=${MAX_LENGTH:-1024} GRAD_ACCUM=${GRAD_ACCUM:-64} SAVE_STEPS=1000 \
-    STAGE=sft WARM_START=pt_ckpt PT_CKPT="$PT" TRUNC=delete GATE=0 \
+# WARM_START_ARM=slice runs SFT straight from the (free) teacher slice -> the
+# "SFT-only" path, no PT stage at all.  Default keeps the PT warm start.
+WARM_MODE=${WARM_START_ARM:-pt_ckpt}
+WS=(WARM_START="$WARM_MODE")
+if [ "$WARM_MODE" = "pt_ckpt" ]; then WS+=(PT_CKPT="$PT"); fi
+
+# NOTE: train_core_lr_pilot.sh has no TOKENS -> MAX_STEPS conversion (MAX_STEPS
+# defaults to 2000).  Pass MAX_STEPS explicitly for a real token budget.
+MS=(); [ -n "${MAX_STEPS:-}" ] && MS=(MAX_STEPS="$MAX_STEPS")
+
+env GPU=0,1 NPROC=2 MAX_LENGTH=${MAX_LENGTH:-1024} GRAD_ACCUM=${GRAD_ACCUM:-64} \
+    SAVE_STEPS=${SAVE_STEPS:-1000} \
+    STAGE=sft "${WS[@]}" TRUNC=delete GATE=0 "${MS[@]}" \
     BRANCH=${BRANCH_ARM:-core} K=${K:-64} LORA_MODE=${LORA_MODE_ARM:-core} FACTORIZED=${FACTORIZED_ARM:-1} FREEZE_COL=${FREEZE_COL_ARM:-true} \
     PLANS=${PLANS_ARM:-0-2} LORA_MODULES=gate_proj,up_proj SEED=42 \
     LR="$LR" TOKENS="$TOKENS" DATASET="${SFT_DATA:-$MIX}" OUTROOT="$OUT" \

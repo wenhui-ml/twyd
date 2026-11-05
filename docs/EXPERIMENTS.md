@@ -20,10 +20,17 @@ Two independent bases (the 1.6B `LRC-1.5B-Base` line and this 936M line) agree:
 ## 1. SFT on the paper's 8-dataset mixture (2026-11-03/04)
 
 Data: `data/sft_paper8.jsonl` — 205,000 samples from 7 ModelScope sources,
-built by `scripts/build_sft_paper8.py`. Recipe: 2,000 steps × 65,536 tok =
-**131M tokens**, `max_length=2048`, lr 1e-5, cosine, default cross-entropy,
+built by `scripts/build_sft_paper8.py`. Recipe: 2,000 steps, `max_length=2048`, lr 1e-5,
+cosine, default cross-entropy,
 layers 0-2 dense (34.87M trainable = 3.72%), teacher on CPU,
 **22.86 GiB peak, 8.1 s/step**.
+
+Budget correction (2026-11-05): `train_core_lr_pilot.sh` has **no** `TOKENS -> MAX_STEPS`
+conversion, so `TOKENS=130000000` was ignored and the run stopped at the default
+2,000 steps = **0.63 epoch ≈ 78M tokens** (`trainer_state.json: epoch 0.631`), not the
+131M implied by `tokens/step=65,536`. The paper's SFT stage is **0.62B tokens ≈ 5 epochs**
+of the same file, i.e. this run was ~8x under the paper's SFT budget. `MAX_STEPS` is now
+passed through explicitly by `scripts/run_sft_mixture.sh`.
 
 | task | n | teacher | PT only | + SFT | Δ | gap to teacher |
 |---|---:|---:|---:|---:|---:|---:|
