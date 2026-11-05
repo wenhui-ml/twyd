@@ -140,7 +140,12 @@ python scripts/export_slice.py --r 2048 --out output/slices/r2048
 PRESET=paper GPU=0 BATCH=16 bash scripts/run_lm_eval.sh output/slices/r2048 paper_r2048
 ```
 
-Widths under test: 768 / 1024 / 1536 / 2048 / 2560 (3072 = the teacher itself).
+Widths under test: **768 / 1152 / 1536 / 1920 / 2304** (3072 = the teacher itself).
+They must be multiples of the teacher's 24 attention heads: the slice keeps the head
+count and shrinks `head_dim`, so 1024/2048/2560 fail HF's `hidden % num_heads`
+config validation. Exported sizes are 803M / 1,205M / 1,606M / 2,008M / 2,410M; the
+r=1536 point (1,606M) matches the paper's released `LRC-1.5B-Base` exactly, which is
+a useful sanity check that the export is the same architecture we train.
 If MMLU rises monotonically with `r` while the 8-task behaviour tasks saturate
 early, then "half the parameters" must be bought by **pruning depth at full width**,
 not by halving the residual stream — and the SFT-only path can only repair what the
