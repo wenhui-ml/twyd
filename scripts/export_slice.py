@@ -34,6 +34,11 @@ def main() -> None:
     ap.add_argument("--r", type=int, required=True, help="target hidden size")
     ap.add_argument("--out", required=True, help="output dir (HF format)")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
+    ap.add_argument("--master-p", default="embed_svd", choices=["embed_svd", "none"],
+                    help=("embed_svd = Paper Alg.1 (i): project the residual stream onto the "
+                          "top-r directions of the tied embedding. 'none' keeps the raw "
+                          "coordinate slice, which is NOT faithful (28 layers compound the "
+                          "half-dot-product error): measured CE 12.46 vs teacher 2.86."))
     args = ap.parse_args()
 
     dtype = getattr(torch, args.dtype)
@@ -50,6 +55,11 @@ def main() -> None:
         raise SystemExit(f"--r {args.r} exceeds the teacher hidden size {h}")
     else:
         shrunk = _shrink_student_(student, teacher, args.r, attn_impl=_attn_impl_of(student))
+        if args.master_p == "embed_svd":
+            from twyd.init import build_master_P, project_student_with_P_
+            P = build_master_P(teacher, args.r)
+            n_proj = project_student_with_P_(shrunk, teacher, P)
+            print(f"[slice] master P {tuple(P.shape)}: projected {n_proj} tensors", flush=True)
 
     os.makedirs(args.out, exist_ok=True)
     shrunk.save_pretrained(args.out)

@@ -99,6 +99,42 @@ Then the SFT stage on top, with the recipe from §1 (`PT_CKPT=<ckpt>`,
 
 | symptom | root cause | fix |
 |---|---|---|
+## 4b. Correction (2026-11-05): the `WARM_START=slice` init was **broken**
+
+Every run in §1-§2 (and the first SFT-only ladder) started from `_shrink_student_`,
+which copies the **top-left block** of each teacher tensor (`t[:r, :r]`). The residual
+stream has no privileged coordinate basis, so truncating coordinates is not a
+projection of the function — it is a random-ish subspace that the layer norms and the
+MLP `W @ x` half-sum then amplify. Measured on the same sentence:
+
+| model | residuals | CE (plain English) | generation |
+|---|---|---:|---|
+| teacher `Llama-3.2-3B-Instruct` | 3072 | **2.855** | coherent |
+| slice r=1536 (top-left block) | 1536 | **12.462** | gibberish |
+| slice r=1536 with `master_p=embed_svd` (Alg.1 (i) SVD basis) | 1536 | 12.773 | gibberish |
+| slice r=3072 (identity) | 3072 | 2.855 | coherent |
+| `LRC-1.5B-Base` (paper release) | 1536 | **3.050** | coherent |
+
+Consequences:
+
+* **The 524M-token PT in §2 was distillation into a random init**, not fine-tuning a
+  teacher projection — which is why it needed so many tokens and why it plateaued
+  around the base model's MMLU. The rank ceiling argument in §5 still stands (it is
+  anchored on `LRC-1.5B-Base`, LoRA r=256 and the teacher — all valid models), but
+  the token-scaling result of §2 is confounded and cannot be read as "tokens do not
+  help a good init".
+* **The first SFT-only ladder (S0/S1) is void**: S0 trained from noise (loss 9.73 ->
+  6.37 after 1,700 steps). The MMLU-vs-rank sweep in §5 is void too — it scored
+  random models (MMLU .22-.28).
+* **Working init, zero cost**: the paper's released `LRC-1.5B-Base` (CE 3.050,
+  paper-8 Avg8 .6550, MMLU .5006). SFT from it reaches **loss 1.245 at step 20**, vs
+  6.37 at step 1,700 from the broken slice — a 2-orders-of-magnitude difference in
+  what the same budget buys.
+* **Still open**: a principled width-r warm start (paper Alg.1 ridge/SVD with
+  calibration activations, `TWYD_MASTER_P` + `calib_ids`) is needed for a real rank
+  sweep. Our embed-SVD attempt (`build_master_P` + `project_student_with_P_`) does not
+  reproduce it, so the capacity question can currently only be probed at r=1536.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
