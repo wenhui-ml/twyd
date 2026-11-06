@@ -156,9 +156,28 @@ Init: `LRC-1.5B-Base` (the paper's released student, CE 3.050). 1 epoch of
 
 Reading: SFT does what it is supposed to on behaviour (+0.87 pt on 7 tasks, every
 one of them up except CSQA) but costs 2.25 pt of MMLU, which eats 80% of the gain.
-The next two arms test whether **adapting fewer layers** keeps the behaviour gain
-and stops the MMLU bleed (the m525 PT study suggests yes: 9 layers matched 28 on
-in-domain CE with far less OOD damage).
+
+**Layer count only trades gain against damage — it does not move the frontier.**
+Same init, same data, same lr, 1 epoch:
+
+| arm | layers | trainable | 7 behaviour | MMLU | Avg8 | dAvg8 |
+|---|---:|---:|---:|---:|---:|---:|
+| `LRC-1.5B-Base` | – | – | .6771 | .5006 | .6550 | – |
+| L1 | 28 (all) | 34.87M | **.6858** | .4781 | **.6598** | +0.48 |
+| M9 | 9 | 11.21M | .6823 | **.4957** | .6589 | +0.39 |
+| M3 | 3 | 3.74M | (running) | | | |
+
+Adapting fewer layers buys back 1.76 pt of MMLU but gives up 0.35 pt of behaviour,
+and the two effects cancel: the net is +0.4~0.5 pt either way. **Behaviour gain and
+knowledge damage scale together with adapter capacity**, i.e. generic instruction
+data slides the model along a trade-off curve instead of pushing it outward. That
+is the empirical answer to "will SFT alone lift the average?": yes, by ~0.4 pt, and
+no more, no matter how the layers are chosen.
+
+The remaining SFT-stage lever that can add *knowledge* (not just behaviour) is the
+distillation objective: `LOSS_TYPE=lrc_distill` on the SFT data, teacher on device.
+That is the next arm (`KD3`), and it is the only cheap test of "can SFT close the
+MMLU gap without a PT stage?".
 
 **Bug (fixed 2026-11-06).** `scripts/run_sft_mixture.sh` passed `PLANS=$PLANS_ARM`,
 but `train_core_lr_pilot.sh` has no `PLANS` variable — the tuner reads
