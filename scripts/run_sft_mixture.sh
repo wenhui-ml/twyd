@@ -38,10 +38,13 @@ if [ "$WARM_MODE" = "pt_ckpt" ]; then WS+=(PT_CKPT="$PT"); fi
 # defaults to 2000).  Pass MAX_STEPS explicitly for a real token budget.
 MS=(); [ -n "${MAX_STEPS:-}" ] && MS=(MAX_STEPS="$MAX_STEPS")
 
+# NOTE: train_core_lr_pilot.sh has no PLANS variable -- passing PLANS= silently adapted
+# ALL 28 layers (bug found 2026-11-06 on the LRC-base SFT ladder). LORA_LAYERS is the
+# knob the tuner actually reads; empty = all layers.
 env GPU=0,1 NPROC=2 MAX_LENGTH=${MAX_LENGTH:-1024} GRAD_ACCUM=${GRAD_ACCUM:-64} \
     SAVE_STEPS=${SAVE_STEPS:-1000} \
     STAGE=sft "${WS[@]}" TRUNC=delete GATE=0 "${MS[@]}" \
     BRANCH=${BRANCH_ARM:-core} K=${K:-64} LORA_MODE=${LORA_MODE_ARM:-core} FACTORIZED=${FACTORIZED_ARM:-1} FREEZE_COL=${FREEZE_COL_ARM:-true} \
-    PLANS=${PLANS_ARM:-0-2} LORA_MODULES=gate_proj,up_proj SEED=42 \
+    LORA_LAYERS="${PLANS_ARM:-}" LORA_MODULES=gate_proj,up_proj SEED=42 \
     LR="$LR" TOKENS="$TOKENS" DATASET="${SFT_DATA:-$MIX}" OUTROOT="$OUT" \
     bash scripts/train_core_lr_pilot.sh 2>&1 | tee "$OUT/run.log" | tail -40

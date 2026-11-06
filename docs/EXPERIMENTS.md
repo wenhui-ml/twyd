@@ -135,6 +135,38 @@ Consequences:
   sweep. Our embed-SVD attempt (`build_master_P` + `project_student_with_P_`) does not
   reproduce it, so the capacity question can currently only be probed at r=1536.
 
+## 4c. First *valid* SFT-only result (2026-11-06): behaviour up, MMLU down
+
+Init: `LRC-1.5B-Base` (the paper's released student, CE 3.050). 1 epoch of
+`data/sft_paper8.jsonl` (3,170 steps, lr 1e-4, CE), **all 28 layers** adapted
+(34.87M trainable — see the `PLANS` bug below). Paper-8, 0-shot:
+
+| task | LRC base | + SFT | delta |
+|---|---:|---:|---:|
+| arc_challenge (acc_norm) | .4258 | **.4437** | +1.79 |
+| arc_easy (acc_norm) | .6970 | **.7125** | +1.55 |
+| boolq | .7330 | .7385 | +0.55 |
+| commonsense_qa | .6519 | .6470 | −0.49 |
+| piqa (acc_norm) | .7155 | **.7258** | +1.03 |
+| sciq (acc_norm) | .9140 | **.9230** | +0.90 |
+| winogrande | .6022 | **.6101** | +0.79 |
+| **mmlu** | .5006 | **.4781** | **−2.25** |
+| **7 behaviour tasks** | .6771 | **.6858** | **+0.87** |
+| **Avg8** | **.6550** | **.6598** | **+0.48** |
+
+Reading: SFT does what it is supposed to on behaviour (+0.87 pt on 7 tasks, every
+one of them up except CSQA) but costs 2.25 pt of MMLU, which eats 80% of the gain.
+The next two arms test whether **adapting fewer layers** keeps the behaviour gain
+and stops the MMLU bleed (the m525 PT study suggests yes: 9 layers matched 28 on
+in-domain CE with far less OOD damage).
+
+**Bug (fixed 2026-11-06).** `scripts/run_sft_mixture.sh` passed `PLANS=$PLANS_ARM`,
+but `train_core_lr_pilot.sh` has no `PLANS` variable — the tuner reads
+`LORA_LAYERS`. Every SFT run before this date therefore adapted **all 28 layers**
+(`lora_layers=all`), not the 0-2 plan its log line claimed. Passing
+`LORA_LAYERS="${PLANS_ARM}"` makes the plan real: 3 layers -> 3.7M trainable,
+9 layers -> 11.2M, all layers -> 34.87M.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
