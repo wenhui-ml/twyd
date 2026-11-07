@@ -254,6 +254,29 @@ choice among these arms is **M9 or KD3** (statistically indistinguishable from t
 base model on the pooled metric, small behaviour gain, and KD3 needs 1/9 of M9's
 adapter parameters). L1 is the only arm that is significantly *worse* overall.
 
+## 4f. Knowledge-injection arm (running, 2026-11-07): teacher-written CoT data
+
+§4e says the SFT stage only moves behaviour, because CE on instruction data never asks
+the student to *recall a fact*. The one SFT-stage lever that can carry knowledge is
+teacher-written text: sequence-level distillation on a corpus of our own.
+
+Pipeline (`scripts/gen_teacher_cot.py` -> `scripts/build_sft_cot_mix.py` -> SFT):
+
+| step | detail |
+|---|---|
+| prompts | fineweb-edu passages (`data/fw_score4_1B.jsonl`); **no paper-8 eval item is ever shown to the teacher** |
+| tasks | 60% "write one 4-option MCQ + answer + reasoning", 40% "write a study note" |
+| volume | 90,000 samples on 2 GPUs, ~20M generated tokens, ~516 tok/s, ~11 h |
+| quality gate | format check on 32 samples: MCQ prompts 19/19 well formed after moving from "2 questions" to "1 question" + `repetition_penalty=1.08`, `temperature=0.6` (the first prompt version looped) |
+| mix | `data/sft_paper8.jsonl` (205k) + CoT x2 -> 385k samples, ~22% CoT tokens |
+| train | `LRC-1.5B-Base`, 9 layers (`0-2,11-13,25-27` = 11.2M trainable), 1 epoch, lr 1e-4, CE |
+| eval | paper-8, paired against base / M9 / M3 / KD3 |
+
+Success criterion, stated before the result: **MMLU must hold at >= .50 (base) while
+behaviour stays at M9's level (+0.49 pt)**. Anything less means sequence-level
+distillation at a 20M-token budget cannot buy knowledge either, and the SFT-only
+question is settled (answer: no parity, ship the behaviour-only win).
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
