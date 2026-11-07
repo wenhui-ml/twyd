@@ -254,6 +254,30 @@ choice among these arms is **M9 or KD3** (statistically indistinguishable from t
 base model on the pooled metric, small behaviour gain, and KD3 needs 1/9 of M9's
 adapter parameters). L1 is the only arm that is significantly *worse* overall.
 
+## 4g. What the chain actually buys vs the paper's own student (paired, decisive)
+
+Everything below is paired McNemar against `LRC-1.5B-Base` - the *released* 1.6B
+student of the same teacher, same hidden 1536 / 28 layers / head_dim 128 architecture
+as ours, and trained by the paper with ~10B tokens.
+
+| arm | tokens | 7 behaviour | MMLU | all 26,186 items |
+|---|---:|---|---|---|
+| PT 524M only (`band-6L`) | 524M | **+0.91 pt, p=1.4e-05** | -0.08 pt, p=0.81 | **+0.38 pt, p=0.038** |
+| **PT 524M + SFT 78M** | **602M** | **+1.69 pt, p=7.4e-14** | -0.37 pt, p=0.22 | **+0.58 pt, p=0.0022** |
+| SFT only, best (L1) | 78M | +0.89 pt, p=2.0e-05 | -2.25 pt, p=1.3e-15 | -0.79 pt, p=9.8e-06 |
+
+This is the one unambiguously positive result of the whole study:
+
+* **The chain dominates the paper's released student at 1/16 of its token budget**
+  (602M vs ~10B): +0.58 pt on the deployment metric (all items pooled), +1.69 pt on the
+  seven behaviour tasks, and MMLU is statistically *untouched* (-0.37, p=0.22).
+* **The PT stage is what protects MMLU.** SFT alone moves behaviour just as well
+  (+0.89) but costs 2.25 pt of MMLU; the same SFT on top of a distilled student costs
+  nothing measurable. So "PT 524M + SFT 78M" is the correct product configuration, and
+  a bigger SFT is not a substitute for the PT stage.
+* Remaining gap to the teacher is -4.42 pt Avg8 / -12.5 pt MMLU, i.e. the knowledge
+  ceiling is still the student's rank (see 4d/5), not the training recipe.
+
 ## 4f. Knowledge-injection arm (running, 2026-11-07): teacher-written CoT data
 
 §4e says the SFT stage only moves behaviour, because CE on instruction data never asks
