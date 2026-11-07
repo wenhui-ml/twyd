@@ -160,12 +160,29 @@ one of them up except CSQA) but costs 2.25 pt of MMLU, which eats 80% of the gai
 **Layer count only trades gain against damage — it does not move the frontier.**
 Same init, same data, same lr, 1 epoch:
 
-| arm | layers | trainable | 7 behaviour | MMLU | Avg8 | dAvg8 |
-|---|---:|---:|---:|---:|---:|---:|
-| `LRC-1.5B-Base` | – | – | .6771 | .5006 | .6550 | – |
-| L1 | 28 (all) | 34.87M | **.6858** | .4781 | **.6598** | +0.48 |
-| M9 | 9 | 11.21M | .6823 | **.4957** | .6589 | +0.39 |
-| M3 | 3 | 3.74M | (running) | | | |
+| arm | layers | trainable | loss | 7 behaviour | MMLU | Avg8 | dAvg8 |
+|---|---:|---:|---|---:|---:|---:|---:|
+| `LRC-1.5B-Base` | – | – | – | .6771 | .5006 | .6550 | – |
+| L1 | 28 (all) | 34.87M | CE | **.6858** | .4781 | **.6598** | **+0.48** |
+| M9 | 9 | 11.21M | CE | .6823 | **.4957** | .6589 | +0.39 |
+| M3 | 3 | 3.74M | CE | .6805 | .4956 | .6574 | +0.24 |
+| KD3 | 3 | 3.74M | distill | .6820 | .4955 | .6587 | +0.37 |
+
+Three things follow from the completed 2x2:
+
+1. **CE scales monotonically with adapter capacity**: +0.24 (3L) -> +0.39 (9L) -> +0.48
+   (28L). Behaviour gain and MMLU damage move together, so the net stays in a narrow
+   band: SFT with generic instruction data buys **at most ~+0.5 pt Avg8**, and no layer
+   choice escapes that.
+2. **Distillation is ~3x more parameter-efficient than CE**: KD3 gets +0.37 with 3.74M
+   params, which is what CE needs 9 layers (11.21M) to reach. But it does *not* reduce
+   the MMLU damage (-0.51, same as CE at the same size) and it does not raise the
+   ceiling. Expected: `LRC-1.5B-Base` is *already* the logit-distillation product of
+   this same teacher, so re-distilling on instruction data adds no new knowledge.
+3. **The gap to the teacher is untouched**: best SFT-only Avg8 .6598 vs teacher .7135
+   (-5.4 pt), and MMLU .478-.496 vs .6222. Every route we have tried lands on the same
+   trade-off curve -- the binding constraint is the student's rank (r=1536), not the
+   adapter, the loss, the token count or the layer plan.
 
 Adapting fewer layers buys back 1.76 pt of MMLU but gives up 0.35 pt of behaviour,
 and the two effects cancel: the net is +0.4~0.5 pt either way. **Behaviour gain and
