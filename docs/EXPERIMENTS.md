@@ -229,6 +229,31 @@ This closes the decision tree for the SFT-only question: with a 100M-1B-token bu
 the only usable student is the already-repaired width-halved one, and SFT on top of it
 is worth **+0.4~0.5 pt Avg8** (§4c), not parity.
 
+## 4e. Paired significance test: the gain is real but the *net* is zero
+
+McNemar on the saved per-item samples (`output/lm_eval/paper_*`, base = `LRC-1.5B-Base`):
+
+| arm | 7 behaviour tasks (n=12,144) | MMLU (n=14,042) | all items (n=26,186) |
+|---|---|---|---|
+| L1 (28L, 34.87M) | **+0.89 pt, p=2.0e-05** | −2.25 pt, p=1.3e-15 | **−0.79 pt, p=9.8e-06** |
+| M9 (9L, 11.21M) | +0.49 pt, p=0.012 | −0.50 pt, p=0.026 | −0.04 pt, p=0.80 (tie) |
+| M3 (3L, 3.74M) | +0.30 pt, p=0.085 | −0.51 pt, p=0.016 | −0.13 pt, p=0.34 (tie) |
+| KD3 (3L, distill) | +0.38 pt, p=0.021 | −0.51 pt, p=0.016 | −0.10 pt, p=0.48 (tie) |
+
+The behaviour gain is **not noise** (p = 2e-05 for L1, and it holds at every capacity).
+But the metric decides the verdict:
+
+* **Paper metric (Avg8 = unweighted mean of the 8 task accuracies)**: +0.24 ~ +0.48 pt.
+  Every task has equal weight, so the 7 behaviour tasks (which improve) count 7/8.
+* **Deployment metric (pool all 26,186 items)**: −0.79 ~ −0.04 pt, because MMLU is 54%
+  of the items and it drops.
+
+So the honest one-line answer to "does SFT help?": **it moves 7 tasks up by 0.3-0.9 pt
+and MMLU down by 0.5-2.3 pt; the pooled effect is a tie at best.** The best product
+choice among these arms is **M9 or KD3** (statistically indistinguishable from the
+base model on the pooled metric, small behaviour gain, and KD3 needs 1/9 of M9's
+adapter parameters). L1 is the only arm that is significantly *worse* overall.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
