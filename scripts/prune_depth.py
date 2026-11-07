@@ -53,6 +53,12 @@ def main() -> None:
     keep = parse_keep(args.keep, n)
     model.model.layers = torch.nn.ModuleList([layers[i] for i in keep])
     model.config.num_hidden_layers = len(keep)
+    # Each surviving attention block keeps the layer_idx it was built with; leaving
+    # them stale breaks KV-cache indexing (IndexError) and any per-layer behaviour,
+    # so renumber them to the new positions.
+    for new_i, mod in enumerate(model.model.layers):
+        if hasattr(mod, "self_attn"):
+            mod.self_attn.layer_idx = new_i
     # Keep the new indices consistent for anything reading per-layer config lists.
     for attr in ("layer_types", "mlp_only_layers", "no_rope_layers"):
         seq = getattr(model.config, attr, None)

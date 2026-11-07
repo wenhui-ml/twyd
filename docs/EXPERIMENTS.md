@@ -203,6 +203,32 @@ but `train_core_lr_pilot.sh` has no `PLANS` variable — the tuner reads
 `LORA_LAYERS="${PLANS_ARM}"` makes the plan real: 3 layers -> 3.7M trainable,
 9 layers -> 11.2M, all layers -> 34.87M.
 
+## 4d. The other compression axis, measured: depth pruning without recovery also collapses
+
+`scripts/prune_depth.py` keeps the teacher at full width (hidden 3072, so every MLP stays
+rank 3072) and drops whole layers. Zero training, scored on one sentence (CE, plain
+English; teacher = 2.855):
+
+| variant | kept layers | CE |
+|---|---|---:|
+| teacher | all 28 | 2.855 |
+| even-spaced | 0,2,...,26 (14) | 10.705 |
+| first half | 0-13 (14) | 11.699 |
+| drop middle | 0-6 + 21-27 (14) | **8.500** |
+| last half | 14-27 (14) | 10.305 |
+
+Even the best variant (dropping the middle) lands at CE 8.5, i.e. unusable, and the
+full eval on the exported even-spaced model scored MMLU .2304 / Avg8 ~.28 (chance).
+
+Conclusion: **both compression axes need PT-scale recovery**, not SFT-scale. The
+width axis already has one because the paper shipped it (`LRC-1.5B-Base`, CE 3.050,
+repaired with ~10B distillation tokens). Depth pruning has no such checkpoint here, so
+at SFT budgets it is strictly worse than just starting from `LRC-1.5B-Base`.
+
+This closes the decision tree for the SFT-only question: with a 100M-1B-token budget
+the only usable student is the already-repaired width-halved one, and SFT on top of it
+is worth **+0.4~0.5 pt Avg8** (§4c), not parity.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
