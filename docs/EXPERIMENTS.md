@@ -345,6 +345,51 @@ user turn (it burns 40% of the 2048-token budget for zero gradient). Expected ou
 +0.4 behaviour with MMLU intact, i.e. Avg8 ~.66 - still short of the teacher, so this
 only buys a cleaner story, not parity.
 
+## 4i. Precision-PT attempt (2026-11-08): warm-start investigation (negative) + knowledge corpus (running)
+
+### The warm start is not reproducible by any simple projection
+
+Lever 1 of `RESULTS_SUMMARY.md` §4 was "fix the PT warm start". Four constructions were
+tested at r=1536 on the same sentence (teacher CE = 2.855):
+
+| construction | CE | note |
+|---|---:|---|
+| raw coordinate slice `t[:r, :r]` (repo default) | 12.462 | residual stream has no privileged basis |
+| `P` = top-r of the **embedding** SVD (`master_p=embed_svd`) | 12.773 | paper Alg.1 step (i) only |
+| `P` = top-r of the **read-energy** `sum_l W^T W` (q,k,v,gate,up) | 11.697 | the subspace the residual is read from |
+| `P` = top-r of the **activation covariance** (118,784 calib tokens) | **9.355** | + norm fix below |
+| `P = I` at r=3072 (identity control) | **2.855** | projection code is correct |
+
+The identity control matters: it proves `project_student_with_P_` is not the bug - only
+the truncation is. Even the best data-aware basis leaves the model useless, i.e. **the
+top-r PCA subspace does not carry Llama's function**: variance is concentrated in a few
+"rogue" directions while the computation lives in the long tail. The paper's Alg.1 is a
+*greedy per-layer ridge*, not a single global PCA, and is not reproduced by any of the
+four approximations above.
+
+One real bug was found and fixed on the way: **`gamma_S = P @ gamma_T` is wrong for
+RMSNorm.** The teacher's norm weights have mean 0.075 (not ~1) and the projection flips
+their sign (`mean -0.003`, range -0.71..+0.52). The correct diagonal approximation is
+`gamma_S[j] = sum_i P[j,i]^2 gamma_T[i] ~= mean(gamma_T)`, which took CE from 12.77 to 9.36.
+
+Why this is a *negative* rather than a blocker: our own PT (which starts from the broken
+slice and repairs it with distillation) reaches **CE 2.44**, better than the paper's
+released 10B-token student (**3.05**). The warm start is therefore not the binding
+constraint we assumed; the PT objective recovers a good student regardless.
+
+### What was launched instead: knowledge-dense PT corpus (lever 2)
+
+`scripts/build_pt_knowledge.py` streams 70% `wikimedia/wikipedia` (20231101.en) + 30%
+`open-web-math` -> `data/pt_knowledge.jsonl`, **279,507 docs / 1.20 GB ≈ 300M tokens**.
+Neither source contains an MMLU/ARC/CSQA item, so this is domain matching, not
+contamination. PT: 6 layers, CORE-LR k=64 (5.11M trainable), logit KD, 300M tokens =
+2,288 steps at 131,072 tok/step, 27.5 s/step, 23.1 GiB -> ~17 h, then paper-8 eval, then
+the standard 9-layer SFT and a second eval (pipeline `know_pt.sh`).
+
+Pre-registered criterion: **PT alone must lift MMLU above .505** (base .5006, our fineweb
+PT .4999). If it does not, no PT-side data choice moves MMLU at r=1536 and the rank
+conclusion of §5 is final.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
