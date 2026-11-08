@@ -301,6 +301,45 @@ behaviour stays at M9's level (+0.49 pt)**. Anything less means sequence-level
 distillation at a 20M-token budget cannot buy knowledge either, and the SFT-only
 question is settled (answer: no parity, ship the behaviour-only win).
 
+## 4h. COT9 result (2026-11-08): CoT data removes the MMLU damage but also the gain -> wash
+
+`LRC-1.5B-Base` + 1 epoch over `data/sft_cot_mix.jsonl` (205k instruction + 90k
+teacher-written CoT x2 = 385k samples, CoT = 55% of tokens by characters / ~26% of the
+loss-bearing tokens), 9 layers (11.2M), lr 1e-4, 6,015 steps, loss 0.977.
+
+Paired McNemar vs `LRC-1.5B-Base` (`output/lm_eval/paper_COT9`):
+
+| metric | COT9 | M9 (same archive, instruction-only) |
+|---|---|---|
+| 7 behaviour tasks | +0.19 pt, p=0.39 (**ns**) | +0.49 pt, p=0.012 |
+| MMLU | **-0.04 pt, p=0.90 (untouched)** | -0.50 pt, p=0.026 |
+| all 26,186 items | +0.06 pt, p=0.73 (wash) | -0.04 pt, p=0.80 (wash) |
+| Avg8 | .6572 (+0.22) | .6589 (+0.39) |
+
+The pre-registered criterion was "MMLU >= .50 AND behaviour >= +0.49". **Half met**: MMLU
+is fully protected for the first time (.5002 vs base .5006, p=0.90), but the behaviour gain
+collapsed to noise.
+
+Reading:
+
+1. **The knowledge-protection half worked.** Every instruction-only arm lost MMLU
+   (-0.5 to -2.3 pt); COT9 is the first arm with zero measurable damage. Teaching the
+   student to answer passage-grounded MCQs with reasoning does protect the behaviour that
+   MMLU rewards.
+2. **The knowledge-*gain* half did not.** MMLU .5002 vs .5006 is a tie, for two reasons:
+   (a) at 55% of the mix the CoT data displaced the instruction data that produced the
+   behaviour gains, so the two effects cancel; (b) the generated knowledge is
+   *passage-derived* - the student can re-derive it from the visible passage, so nothing
+   needs to be memorised, and what is memorised is topically unrelated to MMLU's
+   subjects. The rank ceiling (§5) still caps MMLU at ~.50 either way.
+3. **Net effect is a wash**, so COT9 is not shippable as an improvement over the base
+   student; M9 remains the best *pure-SFT* arm and PT+SFT (§4g) remains the best overall.
+
+The obvious follow-up (not run): re-balance to ~20% CoT and drop the passage from the
+user turn (it burns 40% of the 2048-token budget for zero gradient). Expected outcome
++0.4 behaviour with MMLU intact, i.e. Avg8 ~.66 - still short of the teacher, so this
+only buys a cleaner story, not parity.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
