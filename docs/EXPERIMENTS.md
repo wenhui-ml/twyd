@@ -1,5 +1,10 @@
 # Experiment log — budget-limited reproduction (2026-11)
 
+> **Digest:** `docs/RESULTS_SUMMARY.md` — the headline table, the five findings, the
+> bug list and the ranked remaining levers, in one page. This file is the detailed,
+> chronological log those numbers come from.
+
+
 Everything here runs on one 24 GB ROCm card (RX 7900 XTX class), teacher
 `Llama-3.2-3B-Instruct`, student = same model with the hidden dim halved
 (3072 → 1536, **936.6M** params). The paper's headline uses ~10B compression-stage
