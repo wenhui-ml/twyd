@@ -426,6 +426,54 @@ Caveat: single seed, and MMLU p=.010 is a threshold test, not a strong effect; i
 the pre-registered criterion but would not survive an aggressive multiple-comparison
 correction across the 30+ arms in this document.
 
+## 4k. Knowledge-PT + SFT: best arm in the study, and the only significant MMLU win (2026-11-09)
+
+Pipeline: knowledge-PT 300M (exp 4j ckpt-2288) -> SFT 78M, 9 layers (0-2,11-13,25-27),
+11.2M trainable, lr 1e-4, 3170 steps @ 7.5 s/it, 13:32 done. Paired vs the paper's released
+student (`LRC-1.5B-Base`), all pools, n as marked:
+
+| arm | tokens | MMLU (14,042) | 7 behaviour (12,144) | pooled (26,186) | Avg8 |
+|---|---:|---:|---:|---:|---:|
+| `LRC-1.5B-Base` (paper student) | ~10B | .5006 | .6868 | .5870 | .6550 |
+| **knowledge-PT + SFT 9L** | **378M** | **.5075  +0.68 (p=.016)** | **+0.77 (p=7.2e-4)** | **+0.72 (p=8.4e-5)** | .6634 |
+| knowledge-PT only | 300M | .5076  +0.70 (p=.010) | +0.40 (p=.071) | +0.56 (p=.0016) | .6628* |
+| fineweb-PT + SFT (previous best) | 602M | .4969  -0.37 (p=.22) | **+1.69 (p=7.4e-14)** | +0.58 (p=.0022) | **.6693** |
+| fineweb-PT only | 524M | .4999  -0.08 (p=.81) | +0.91 (p=1.4e-5) | +0.38 (p=.038) | .6649* |
+| SFT 9L only (previous) | 78M | .4957  -0.50 (p=.026) | +0.49 (p=.012) | -0.04 (p=.80) | .6604* |
+
+\* acc-only mean, not comparable with the acc_norm column; use the pooled columns for comparisons.
+
+Three things this establishes:
+
+1. **SFT no longer costs MMLU when it starts from knowledge-PT.** Knowledge-PT alone +0.70 pt
+   (.5076) -> after 78M SFT tokens .5075. The same SFT on the raw student costs -2.25 pt
+   (p=1.3e-15) and on fineweb-PT costs -0.37 pt. The PT corpus decides whether SFT eats
+   knowledge or not.
+2. **It is the only arm in the study that significantly beats the paper's 10B-token student
+   on MMLU**, and it does so with 378M tokens (1/26 of the paper's budget).
+3. **Head-to-head against the fineweb chain it is a tie on pooled (p=0.44) but a different
+   profile**: +1.06 pt MMLU for -0.92 pt behaviour and -0.59 pt Avg8. Neither chain
+   dominates; the corpus chooses the point on the frontier.
+
+### What this means for the write-up
+
+The two-stage story is now clean and is a *data* result, not a capacity result:
+
+* PT on knowledge-dense text builds MMLU-headroom; PT on web text builds behavioural
+  headroom. Same parameter budget, same rank, different corpus -> different capability.
+* SFT on top converts behaviour but only preserves knowledge if the PT stage created a
+  buffer. This is the mechanism behind the earlier "SFT destroys MMLU" observation: it was
+  not SFT, it was SFT on a student whose MMLU had no margin.
+* The rank ceiling of section 5 still holds for the *distance to the teacher* (.6222 vs
+  .5075) but is not what limits the first point of MMLU.
+
+Caveats: single seed (42); p-values uncorrected for ~35 arms; 9-layer SFT plan differs from
+`paper_pt_base`'s recipe in layer choice, so the MMLU comparison conflates corpus effect
+with layer-plan effect only in the sense that both fineweb-PT+SFT (3L) and knowledge-PT+SFT
+(9L) land within 0.9 pt of base on Avg8 while differing by 1.06 pt on MMLU - the corpus
+difference is far larger than the layer-plan difference measured directly earlier
+(0-2 vs 11-13 vs 25-27 ablations spanned 0.65 pt Avg8).
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with

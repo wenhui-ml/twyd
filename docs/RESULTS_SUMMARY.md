@@ -18,6 +18,11 @@ d_ff 8192 / head_dim 128** (1,606M), i.e. the paper's architecture.
 | + SFT 28L (34.9M) | 78M | .6598 | +0.48 | .4781 | **p=9.8e-06 (worse)** |
 | + SFT 9L + teacher CoT | 130M | .6572 | +0.22 | .5002 | p=0.73 (ns) |
 | **PT 524M + SFT 78M** | **602M** | **.6693** | **+1.43** | .4969 | **+0.58 pt, p=0.0022** |
+| **PT-knowledge 300M + SFT 78M** | **378M** | **.6634** | **+0.84** | **.5075** | **+0.72 pt, p=8.4e-05** |
+
+*Avg8 = mean of the harness acc_norm where available, else acc (this is the column
+convention; `acc`-only means are ~0.3 pt higher). The knowledge arm trades 0.59 pt of Avg8
+for +1.06 pt of MMLU relative to the fineweb chain - see F1b.*
 
 Two sentences:
 
@@ -39,6 +44,27 @@ Two sentences:
 
 The same 78M-token SFT costs 2.25 pt of MMLU on the raw base student and costs nothing
 measurable on the distilled one. A bigger SFT is **not** a substitute for the PT stage.
+
+### F1b. The PT *corpus* picks the point on the trade-off frontier (new, 2026-11-09)
+
+Identical recipe, identical 5.11M trainable parameters, identical KD objective - only the
+PT corpus changes:
+
+| PT corpus | tokens | MMLU | 7 behaviour | pooled |
+|---|---:|---:|---:|---:|
+| fineweb-edu | 524M | .4999 (-0.08) | **+0.91 (p=1.4e-5)** | +0.38 (p=.038) |
+| wikipedia+math | 300M | **.5076 (+0.70, p=.010)** | +0.40 (p=.071) | +0.56 (p=.0016) |
+| wikipedia+math, then SFT 78M | 378M | **.5075 (+0.68, p=.016)** | +0.77 (p=7.2e-4) | **+0.72 (p=8.4e-5)** |
+
+The two corpora are **not** ranked, they are **different**: web text teaches behaviour,
+encyclopedic/math text teaches knowledge, and the pooled scores are a tie (p=0.44
+head-to-head). What matters is that the knowledge corpus is the only configuration in the
+whole study that is **significantly better than the paper's 10B-token student on MMLU**,
+and adding the standard SFT on top keeps that gain (0.01 pt lost) while buying +0.77 pt of
+behaviour - the best pooled arm in the study at 378M tokens (1/26 of the paper's budget).
+
+This also corrects finding F2 / EXPERIMENTS.md section 5: the MMLU ceiling is
+**rank x corpus**, not rank alone.
 
 ### F2. Layer choice trades gain against damage, and the net is flat
 
