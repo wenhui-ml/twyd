@@ -390,6 +390,42 @@ Pre-registered criterion: **PT alone must lift MMLU above .505** (base .5006, ou
 PT .4999). If it does not, no PT-side data choice moves MMLU at r=1536 and the rank
 conclusion of §5 is final.
 
+## 4j. Knowledge-dense PT lifts MMLU: the rank ceiling was a *data* artefact (2026-11-09)
+
+Same recipe as every other PT arm (6 layers 0-2,11-13, CORE-LR k=64, 5.11M trainable,
+logit KD, identical hyper-parameters). **The only change is the corpus**: 300M tokens of
+70% wikipedia + 30% open-web-math instead of 524M tokens of fineweb-edu.
+
+| pool | n | base | knowledge-PT 300M | fineweb-PT 524M (=same layers) |
+|---|---:|---:|---:|---:|
+| **MMLU** | 14,042 | .5006 | **.5076  +0.70 pt (p=1.0e-2)** | .4999  -0.08 pt (p=.81) |
+| 7 behaviour | 12,144 | .6868 | .6908  +0.40 pt (p=.071) | **.6959  +0.91 pt (p=1.4e-5)** |
+| pooled 8 | 26,186 | .5870 | **.5926  +0.56 pt (p=1.6e-3)** | .5908  +0.38 pt (p=.038) |
+
+Pre-registered criterion (§4i) was "PT alone must lift MMLU above .505" -> **.5076, met**,
+with a paired test to back it (discordant 665/763). This is the **first significant MMLU
+movement in the entire study**, and it was produced by data, not capacity: the same 5.11M
+adapter parameters were flat at .4999 for 524M tokens and then for 2B tokens of fineweb.
+
+### The correction to section 5
+
+Section 5 concluded "MMLU is capped ~.50 by MLP rank <= 1536". That conclusion is **wrong as
+stated** - it is capped by *rank x corpus*: with web text, no amount of tokens or parameters
+moves MMLU; with encyclopedic/math text, 300M tokens move it +0.70 pt at the same rank. The
+rank wall is real (the teacher's .6222 stays far away, and 8.8x more adapter params bought
+<0.6 pt) but it was not the binding constraint on the *first* fraction of a point.
+
+### A real trade-off, stated honestly
+
+fineweb-PT is better on behaviour (+0.91 vs +0.40 pt) and worse on knowledge (-0.08 vs
++0.70 pt). The two corpora teach different things and **neither dominates**. The obvious
+next arm is a 50/50 token mixture (150M + 150M) to test additivity - if the effects add,
+pooled goes to ~+0.65 pt, which would be the best PT-only arm in the study.
+
+Caveat: single seed, and MMLU p=.010 is a threshold test, not a strong effect; it survives
+the pre-registered criterion but would not survive an aggressive multiple-comparison
+correction across the 30+ arms in this document.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
