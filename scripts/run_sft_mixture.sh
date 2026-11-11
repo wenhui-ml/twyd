@@ -45,6 +45,6 @@ env GPU=0,1 NPROC=2 MAX_LENGTH=${MAX_LENGTH:-1024} GRAD_ACCUM=${GRAD_ACCUM:-64} 
     SAVE_STEPS=${SAVE_STEPS:-1000} \
     STAGE=sft "${WS[@]}" TRUNC=delete GATE=0 "${MS[@]}" \
     BRANCH=${BRANCH_ARM:-core} K=${K:-64} LORA_MODE=${LORA_MODE_ARM:-core} FACTORIZED=${FACTORIZED_ARM:-1} FREEZE_COL=${FREEZE_COL_ARM:-true} \
-    LORA_LAYERS="${PLANS_ARM:-}" LORA_MODULES=gate_proj,up_proj SEED=42 \
+    LORA_LAYERS="${PLANS_ARM:-}" LORA_MODULES=gate_proj,up_proj SEED=${SEED:-42} \
     LR="$LR" TOKENS="$TOKENS" DATASET="${SFT_DATA:-$MIX}" OUTROOT="$OUT" \
     bash scripts/train_core_lr_pilot.sh 2>&1 | tee "$OUT/run.log" | tail -40
