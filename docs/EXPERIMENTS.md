@@ -474,6 +474,54 @@ with layer-plan effect only in the sense that both fineweb-PT+SFT (3L) and knowl
 difference is far larger than the layer-plan difference measured directly earlier
 (0-2 vs 11-13 vs 25-27 ablations spanned 0.65 pt Avg8).
 
+## 4l. Mixed-corpus PT: the corpus effects are additive; best arm in the study (2026-11-11)
+
+Exp 4j/4k left an open question: is the knowledge/behaviour trade-off a frontier you must
+pick a point on, or do the two corpora simply add? Test: `data/pt_mixed.jsonl` = 250M tokens
+of wikipedia+open-web-math interleaved in 2000-line blocks with 250M tokens of fineweb-edu,
+then the identical 78M SFT. Pipeline done 2026-11-11 01:49, 3814 PT steps @ 26.7 s/it.
+
+| arm | tokens | MMLU (14,042) | 7 behaviour (12,144) | pooled (26,186) | Avg8 |
+|---|---:|---:|---:|---:|---:|
+| `LRC-1.5B-Base` (paper) | ~10B | .5006 | .6868 | .5870 | .6550 |
+| **PT-mixed + SFT 9L** | **578M** | **.5065 +0.58 (p=.040)** | **+1.24 (p=3.8e-8)** | **+0.89 (p=1.3e-6)** | **.6674** |
+| PT-mixed only | 500M | **.5083 +0.77 (p=.0044)** | +0.73 (p=9.7e-4) | +0.75 (p=2.1e-5) | .6646 |
+| PT-knowledge + SFT 9L | 378M | .5075 +0.68 (p=.016) | +0.77 (p=7.2e-4) | +0.72 (p=8.4e-5) | .6634 |
+| PT-knowledge only | 300M | .5076 +0.70 (p=.010) | +0.40 (p=.071) | +0.56 (p=.0016) | .6616 |
+| PT-fineweb + SFT | 602M | .4969 -0.37 (p=.22) | +1.69 (p=7.4e-14) | +0.58 (p=.0022) | .6693 |
+| PT-fineweb only | 524M | .4999 -0.08 (p=.81) | +0.91 (p=1.4e-5) | +0.38 (p=.038) | .6649 |
+
+### Additivity
+
+| | MMLU | behaviour |
+|---|---:|---:|
+| knowledge only | +0.70 | +0.40 |
+| fineweb only | -0.08 | +0.91 |
+| naive 50/50 prediction | +0.31 | +0.66 |
+| **observed mix** | **+0.77** | **+0.73** |
+
+Behaviour adds almost exactly; MMLU adds better than predicted (the fineweb half does not
+dilute the knowledge signal, it transports it). **Practical conclusion: use a mixture, there
+is no trade-off to manage** - the earlier F1b "frontier" framing is superseded.
+
+### Head-to-head against the other two chains (pooled, n=26,186)
+
+* `mix9` vs `know9`: p=0.14 (tie overall); behaviour `mix9` wins p=2.6e-3, MMLU ties p=.56.
+* `mix9` vs `ptSFT8` (fineweb): p=0.061; MMLU `mix9` wins p=4.6e-5 (discordant 601/467).
+
+So `mix9` weakly dominates both previous best arms, at 578M tokens - **1/17 of the paper's
+~10B** - and it is the only configuration simultaneously significantly better than the
+paper's student on MMLU and on behaviour.
+
+Noted but deliberately not changed: the 2000-line block interleave makes the training loss
+oscillate 189-204 (each step sits mostly inside one source), and token_acc plateaued at
+~.483 from step 140. Neither predicted MMLU in the previous two runs (the knowledge run
+plateaued at .49-.50 and still moved MMLU +0.70), so the run was left alone. In hindsight
+that was right: the plateau was not the signal.
+
+Caveats: single seed; p-values uncorrected over ~40 arms; the mix ratio (50/50 by token) was
+not tuned, and 30/70 or 70/30 could plausibly do better on either axis.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with

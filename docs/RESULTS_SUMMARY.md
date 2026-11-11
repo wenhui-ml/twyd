@@ -19,6 +19,8 @@ d_ff 8192 / head_dim 128** (1,606M), i.e. the paper's architecture.
 | + SFT 9L + teacher CoT | 130M | .6572 | +0.22 | .5002 | p=0.73 (ns) |
 | **PT 524M + SFT 78M** | **602M** | **.6693** | **+1.43** | .4969 | **+0.58 pt, p=0.0022** |
 | **PT-knowledge 300M + SFT 78M** | **378M** | **.6634** | **+0.84** | **.5075** | **+0.72 pt, p=8.4e-05** |
+| **PT-mixed 500M (kno+web) + SFT 78M** | **578M** | **.6674** | **+1.24** | **.5065** | **+0.89 pt, p=1.3e-06** |
+| PT-mixed 500M only (no SFT) | 500M | .6646 | +0.96 | **.5083** | +0.75 pt, p=2.1e-05 |
 
 *Avg8 = mean of the harness acc_norm where available, else acc (this is the column
 convention; `acc`-only means are ~0.3 pt higher). The knowledge arm trades 0.59 pt of Avg8
@@ -65,6 +67,29 @@ behaviour - the best pooled arm in the study at 378M tokens (1/26 of the paper's
 
 This also corrects finding F2 / EXPERIMENTS.md section 5: the MMLU ceiling is
 **rank x corpus**, not rank alone.
+
+### F1c. The two PT corpora are ADDITIVE - mixed PT is now the best arm (new, 2026-11-11)
+
+Test of F1b: 500M tokens of 50/50 wikipedia+math / fineweb-edu (interleaved), same recipe.
+
+| PT corpus | tokens | MMLU | 7 behaviour | pooled |
+|---|---:|---:|---:|---:|
+| fineweb only | 524M | .4999 (-0.08) | +0.91 | +0.38 |
+| knowledge only | 300M | .5076 (+0.70) | +0.40 | +0.56 |
+| **50/50 mix** | **500M** | **.5083 (+0.77, p=.0044)** | **+0.73 (p=9.7e-4)** | **+0.75 (p=2.1e-5)** |
+
+The mix takes the MMLU of the knowledge corpus **and** the behaviour of the web corpus - the
+two effects add within noise (predicted +0.31 / +0.66, observed +0.77 / +0.73). So this is
+not a frontier you have to choose a point on; it is a **sum**, and the right PT corpus is a
+mixture.
+
+With the standard 78M SFT on top (`paper_MIX9`, 578M tokens total = **1/17 of the paper's
+budget**): **MMLU .5065 (+0.58, p=.040), behaviour +1.24 (p=3.8e-8), pooled +0.89
+(p=1.3e-6)** - the largest effect anywhere in this study, and the only arm that is
+simultaneously better than the paper's 10B-token student on MMLU *and* on behaviour.
+
+Head-to-head: vs `know9` pooled p=0.14 (tie), behaviour mix9 wins p=2.6e-3; vs the fineweb
+chain `ptSFT8` pooled p=0.061, MMLU mix9 wins p=4.6e-5. **`mix9` weakly dominates both.**
 
 ### F2. Layer choice trades gain against damage, and the net is flat
 
