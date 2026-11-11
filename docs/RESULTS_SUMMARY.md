@@ -24,15 +24,20 @@ d_ff 8192 / head_dim 128** (1,606M), i.e. the paper's architecture.
 
 *Avg8 = mean of the harness acc_norm where available, else acc (this is the column
 convention; `acc`-only means are ~0.3 pt higher). The knowledge arm trades 0.59 pt of Avg8
-for +1.06 pt of MMLU relative to the fineweb chain - see F1b.*
+for +1.06 pt of MMLU relative to the fineweb chain - see F1b. **Superseded by F1c**: the
+50/50 mixture gets both, so no trade-off has to be accepted.*
 
-Two sentences:
+Three sentences:
 
-* **The PT + SFT chain is the only configuration that is significantly better than the
-  paper's own released student on the deployment metric**, and it does it with **1/16 of
-  the tokens** (602M vs ~10B).
-* **SFT alone cannot beat the base student**: five arms, every one lands in the +0.2~+0.5
-  Avg8 band with a pooled effect of "tie" or "worse".
+* **A PT course on a 50/50 mixture of encyclopedic/math text and web text, followed by the
+  standard SFT, is the best configuration in the study**: +0.89 pt pooled over 26,186 paired
+  items (p=1.3e-06), +0.58 pt MMLU (p=.040), +1.24 pt behaviour (p=3.8e-08), Avg8 .6674 -
+  all for **578M training tokens, 1/17 of the paper's ~10B**.
+* **The PT corpus decides which capability you get, and the two corpora add**: knowledge text
+  buys MMLU (+0.70), web text buys behaviour (+0.91), the mixture delivers both (+0.77 /
+  +0.73). SFT alone cannot substitute for either - it never beats the base student.
+* **SFT only costs MMLU when the PT stage left no margin**: -2.25 pt from the raw student,
+  -0.37 pt after web PT, **-0.19 pt after the mixed PT** which itself is +0.77.
 
 ## 2. Findings
 
