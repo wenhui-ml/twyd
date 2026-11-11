@@ -474,6 +474,34 @@ with layer-plan effect only in the sense that both fineweb-PT+SFT (3L) and knowl
 difference is far larger than the layer-plan difference measured directly earlier
 (0-2 vs 11-13 vs 25-27 ablations spanned 0.65 pt Avg8).
 
+## 4m. Bug 7: `SEED` is inert - the pipeline is deterministic (2026-11-11)
+
+A seed-43 replication of the best arm (4l) was launched to answer "is +0.89 pt one lucky
+seed?". After 1,610 steps the two runs were **identical**:
+
+| step | loss s42 | loss s43 | acc s42 | acc s43 |
+|---:|---:|---:|---:|---:|
+| 1 | 200.80 | 200.80 | .4584 | .4584 |
+| 520 | 200.90 | 201.00 | .4821 | .4820 |
+| 1040 | 188.60 | 188.60 | .4876 | .4876 |
+| 1610 | 190.40 | 190.40 | .4800 | .4797 |
+
+max |dloss| = 1.0 (one step), max |dacc| = 4e-4 over 162 logged steps.
+
+Cause: `--seed` reaches `TrainingArguments.seed`, but nothing in this path consumes RNG.
+The CORE-LR adapter is initialised from a deterministic SVD of the teacher's weights, one
+factor is frozen (`FREEZE_COL=true`), there is no dropout, and swift's `dataset_shuffle=True`
+shuffles with an internally fixed seed rather than `--seed`. The run was killed at 42%
+(~16 h of GPU saved) rather than finished as a duplicate.
+
+**Consequence for the claims.** Every number in this document is a *single deterministic
+run*: there is no seed variance to average over, so "single seed" is not the caveat it looks
+like - but equally, none of the p-values in this study include training uncertainty. The only
+honest robustness test is to perturb the **data order**, which is what was launched instead:
+`data/pt_mixed_shuf.jsonl` (the same 432k documents / 500M tokens, globally shuffled) through
+the identical PT + SFT chain. It diverges immediately from the original (first-step loss
+199.4 vs 200.8). Pipeline ETA 2026-11-13 ~12:00.
+
 ## 4l. Mixed-corpus PT: the corpus effects are additive; best arm in the study (2026-11-11)
 
 Exp 4j/4k left an open question: is the knowledge/behaviour trade-off a frontier you must

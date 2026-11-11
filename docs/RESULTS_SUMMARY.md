@@ -144,7 +144,7 @@ recovered checkpoint (`LRC-1.5B-Base`, CE 3.050 vs teacher 2.855).
 | `LOSS_TYPE=nll` | `KeyError`; `nll` is not a registered loss | empty `LOSS_TYPE` omits the flag (swift default CE) |
 | depth pruning left stale `layer_idx` | KV-cache `IndexError`, wrong per-layer behaviour | renumber on prune |
 | complement basis `U⊥` built for all 84 MLP modules | 9 GiB of dead weight, SFT OOM at 23.19 GiB before step 1 | build lazily for planned modules only (48 tests still pass) |
-| `TOKENS` was never converted to `MAX_STEPS` in the SFT launcher | the "131M token" SFT run was really 2,000 steps = 0.63 epoch ≈ 78M tokens | pass `MAX_STEPS` explicitly |
+| `SEED` is an inert knob in this pipeline | a "seed-43 replication" reproduced seed 42 **bit-for-bit** (max |Δacc| = 4e-4 over 162 logged steps): the CORE-LR adapter init comes from a deterministic teacher SVD, there is no dropout, and swift's dataset shuffle uses an internal fixed seed. **Every arm in this study is a single deterministic run; there is no seed variance to average over**, and proving robustness requires perturbing the *data order*, not the seed | documented; replication now done by globally shuffling the corpus (`data/pt_mixed_shuf.jsonl`) instead of changing `SEED` |
 
 ## 4. Remaining levers, ranked by evidence
 
