@@ -578,6 +578,48 @@ Notes:
   p-values are item-sampling p-values against a model that is reproducible up to 0.01 pt of
   order noise.
 
+## 4o. Bug 8: the paper's auxiliary alignment term never ran, and on a bad init it hurts
+
+`config.py` documents the paper recipe as `kl_temperature=40, kl_weight=1.0, ntp_weight=1.0,
+aux_weight=0.2, use_aux=True` (Eq.7: `1/L sum_l ||h^S_l P - h^T_l||^2`, 4 matched layers, one
+shared least-squares P, zero deployable parameters). Three separate bugs kept it off:
+
+1. `run_v15_w1.sh:109` passed a **literal `USE_AUX=0`**, not `${USE_AUX:-0}` - the flag could
+   not be set from outside at all.
+2. After fixing that, `train_core_lr_pilot.sh`'s `GATE=0` + `WARM_START=slice` guard exported
+   `TWYD_USE_AUX=0` while printing *"override with USE_AUX=1"*. The override never worked, so
+   the first "aux arm" (500M tokens, launched 13:07) was a **bit-identical duplicate** of the
+   non-aux run - its loss hit 200.8 at step 10 and `L_align` never printed.
+3. Even when reached, the aux block computed teacher hidden states over the full 2048-token
+   window (34 layers x 1x2048x3072 bf16 = **428 MB**) on a card with ~380 MB free, OOM'd, and
+   the OOM was swallowed by `except Exception: aux = None`.
+
+Fixes (commit `ed40abb`): `AUX_FORCE=1` escapes the guard; alignment uses a 512-token window
+with a **second short teacher forward** (logits still come from the full-length forward); every
+skip/OOM is logged once; and `L_align active` now prints `lam*aux` so the magnitude is visible.
+Verified: `L_align active: layers=[0, 9, 19, 28] P=(1536, 3072) aux=10.69 lam*aux=2.14`.
+
+### With aux actually on, the init mattered more than lambda
+
+The unconditional MSE on Llama residual streams is O(200) because the 1536-d student and the
+3072-d teacher differ in scale, so `lambda=0.2` contributed ~45 to a loss of ~200 and drove
+`grad_norm` from 10 to 113 (every step clipped). With the relative form
+`||h^S P - h^T||^2 / ||h^T||^2` (aux ~11, `lam*aux` ~2) it is still strong enough to fight the
+KL on the **broken slice init**: measured loss **346 vs 200** and `grad_norm 38 vs 10` over the
+first 10 steps. The launcher's guard - written for debug smokes and worded as a hard override -
+was **substantively right**: hidden-state alignment only regularises once the student already
+sits near the teacher.
+
+Conclusion: Eq.7 is not a free lever on top of a random init. It is being tested where it is
+gentle - the 78M-token SFT stage from the good PT checkpoint
+(`scripts/queue_aux_sft_arm.sh`, arm `paper_DIST9`). That arm also switches SFT from plain CE
+to the paper's `lrc_distill` loss (KL T=40 + CE + aux), because **our SFT had been CE-only -
+a third deviation from the paper recipe**, on top of `USE_AUX=0` and never training `down_proj`.
+Two caveats on that arm: it changes two things at once (CE->KD and aux on), and `grad_norm`
+starts at ~61 with clip 1.0, so if the eval lands on top of the PT checkpoint's numbers
+(.5083 / .6646) the run barely moved and must be re-tuned (lower LR or a smaller KL weight)
+before it counts as evidence either way.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
