@@ -85,6 +85,7 @@ class LrcDistillLoss(_BaseLoss):
         self.wNTP = float(kw.get("ntp_weight", 1.0))
         self.lam = float(kw.get("aux_weight", 0.2))
         self.use_aux = bool(kw.get("use_aux", True))
+        self._aux_norm = bool(kw.get("aux_norm", False))
         self.stage = str(kw.get("stage", "pt")).lower()
 
     def _unwrap(self, model):
@@ -310,6 +311,19 @@ class LrcDistillLoss(_BaseLoss):
                                 term = (((pr - tg.float()) ** 2) * mm).sum() / mm.sum().clamp_min(1.0)
                             else:
                                 term = F.mse_loss(pred.float(), th.float())
+                            if self._aux_norm:
+                                # Relative alignment error: ||h^S P - h^T||^2 / ||h^T||^2.
+                                # The absolute MSE on Llama residual streams is O(200)
+                                # because of the norm mismatch between the 1536-d student
+                                # and the 3072-d teacher; with lambda=0.2 that term
+                                # dominated the KL (loss 245 vs 200, grad_norm 113 vs 10)
+                                # and turned every step into a clipped step. Normalising
+                                # keeps the paper's lambda with an O(1) term.
+                                _pf = pred.float()
+                                _tf = th.float()
+                                _num = ((_pf - _tf) ** 2).sum(-1)
+                                _den = (_tf ** 2).sum(-1).clamp_min(1e-6)
+                                term = (_num / _den).mean()
                             if torch.isfinite(term):
                                 acc = acc + term
                                 cnt += 1
@@ -320,7 +334,9 @@ class LrcDistillLoss(_BaseLoss):
                         if not getattr(self, "_aux_logged", False):
                             self._aux_logged = True
                             print(f"[twyd] L_align active: layers={idxs} "
-                                  f"P={None if P is None else tuple(P.shape)}", flush=True)
+                                  f"P={None if P is None else tuple(P.shape)} "
+                                  f"aux={float(aux):.4g} lam={lam} "
+                                  f"lam*aux={lam * float(aux):.4g} norm={self._aux_norm}", flush=True)
                     elif not getattr(self, "_aux_skip_logged", False):
                         # Silent drops are how the old aux term went missing for
                         # a whole study: say WHY instead of skipping quietly.

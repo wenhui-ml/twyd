@@ -1249,6 +1249,9 @@ def _twyd_kw(args) -> dict:
             kw["max_aux_seq"] = int(ms_)
         except Exception:
             pass
+    an = _os.environ.get("TWYD_AUX_NORM", None)
+    if an is not None and an != "":
+        kw["aux_norm"] = an.strip().lower() not in ("0", "false", "no", "off")
     return kw
 
 
