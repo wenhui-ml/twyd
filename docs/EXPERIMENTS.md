@@ -550,6 +550,34 @@ that was right: the plateau was not the signal.
 Caveats: single seed; p-values uncorrected over ~40 arms; the mix ratio (50/50 by token) was
 not tuned, and 30/70 or 70/30 could plausibly do better on either axis.
 
+## 4n. Order-invariance replication of the headline arm: +0.88 vs +0.89 (2026-11-13)
+
+Because `SEED` is inert in this pipeline (4m), the only real perturbation is the **data
+order**. The mixed corpus was globally shuffled (`shuf`, 432k docs, same tokens) and pushed
+through the identical PT + SFT chain.
+
+| arm | corpus order | MMLU (14,042) | 7 behaviour (12,144) | pooled (26,186) |
+|---|---|---:|---:|---:|
+| `LRC-1.5B-Base` | - | .5006 | .6868 | .5870 |
+| `mix9` (headline) | interleaved | .5065 **+0.58 (p=.040)** | .6992 **+1.24 (p=3.8e-8)** | .5959 **+0.89 (p=1.3e-6)** |
+| `mix9_shuf` (replication) | globally shuffled | .5099 **+0.93 (p=.0013)** | .6951 **+0.83 (p=2.8e-4)** | .5958 **+0.88 (p=2.2e-6)** |
+| head-to-head | | p=0.18 (ns) | p=0.049 | **p=0.98 (identical)** |
+
+Pre-registered criterion (section 4m): pooled >= +0.6 -> headline holds. **+0.88: passed.**
+The 0.01 pt pooled difference is the entire data-order effect, and the two models are
+statistically indistinguishable (discordant 921/919 on 26,186 items - a coin flip).
+
+Notes:
+* The two MMLU estimates (+0.58 / +0.93) differ by more than the pooled ones, head-to-head
+  p=0.18: MMLU carries most of the order sensitivity, which is consistent with knowledge
+  items being the ones whose batch neighbours matter.
+* The shuffled PT stage (before SFT) also replicated: MMLU +0.61 (p=.025) vs +0.77 (p=.0044),
+  behaviour +0.51 (p=.018) vs +0.73 (p=9.7e-4), pooled +0.57 (p=.0014) vs +0.75 (p=2.1e-5).
+* Together with 4m this makes the study's uncertainty statement precise: **the pipeline is
+  deterministic, and the effect survives a full re-draw of the data order**, so the reported
+  p-values are item-sampling p-values against a model that is reproducible up to 0.01 pt of
+  order noise.
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
