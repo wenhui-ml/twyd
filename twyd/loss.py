@@ -170,19 +170,16 @@ class LrcDistillLoss(_BaseLoss):
             get_t = getattr(raw_model, "get_teacher_outputs", None)
         if get_t is not None and inputs:
             try:
-                _want_hidden = bool(use_aux and lam > 0)
-                _tt = _tick() if _p else 0.0
-                t_out = get_t(output_hidden_states=_want_hidden,
+                # Teacher hidden states cost ~428 MB at SEQ=2048 (34 layers x 1x2048x3072
+                # bf16) and OOM'd a 24 GB card; ask for logits only here and fetch the
+                # hidden states from a second, truncated forward inside the aux block.
+                t_out = get_t(output_hidden_states=False,
                               **{k: v for k, v in inputs.items()
                                  if k in ("input_ids", "attention_mask", "position_ids")})
                 t_logits = (t_out.logits if hasattr(t_out, "logits") else t_out["logits"]).detach()
                 if _p:
                     _PROF["t_teacher"] += _tock(_tt)
-                try:
-                    # hidden_states only if model was run with output_hidden_states=True
-                    t_hidden = getattr(t_out, "hidden_states", None)
-                except Exception:
-                    t_hidden = None
+                t_hidden = None  # filled by the aux block via a short second forward
             except Exception:
                 t_logits = None
         shift_s = logits[..., :-1, :].contiguous()
@@ -220,6 +217,30 @@ class LrcDistillLoss(_BaseLoss):
         aux = None
         if use_aux and lam > 0:
             try:
+                # Alignment does not need the full context. Re-forwarding the student
+                # over SEQ=2048 with output_hidden_states=True costs ~2 GiB of
+                # activations, which OOM'd a 24 GB card at SEQ=2048 and was then
+                # swallowed by the `except` below - i.e. the aux term silently
+                # vanished for the whole 500M-token aux arm (bug 8, 2026-11-13).
+                # Truncate the alignment window (default 512 tokens).
+                _aux_seq = int((self.kw or {}).get("max_aux_seq", 512) or 512)
+                _aux_inputs = {k: v for k, v in inputs.items()
+                               if k in ("input_ids", "attention_mask", "position_ids")}
+                if _aux_inputs.get("input_ids") is not None:
+                    _full = inputs.get("input_ids").shape[1]
+                    if _full > _aux_seq:
+                        _aux_inputs = {k: v[:, :_aux_seq] for k, v in _aux_inputs.items()}
+                # Second, short teacher forward for the alignment targets only.
+                if get_t is not None and _aux_inputs:
+                    try:
+                        _t_short = get_t(output_hidden_states=True, **_aux_inputs)
+                        t_hidden = getattr(_t_short, "hidden_states", None)
+                    except Exception as _e:
+                        t_hidden = None
+                        if not getattr(self, "_aux_err_logged", False):
+                            self._aux_err_logged = True
+                            print(f"[twyd] L_align teacher hidden forward FAILED: "
+                                  f"{type(_e).__name__}: {_e}", flush=True)
                 s_hidden = getattr(outputs, "hidden_states", None)
                 if s_hidden is None:
                     # Ask the wrapper to re-run student with hidden states only
@@ -233,16 +254,23 @@ class LrcDistillLoss(_BaseLoss):
                             has_real_forward = st is not None and not type(st).__name__.startswith("Fake")
                         except Exception:
                             has_real_forward = False
-                        if inputs and has_real_forward:
+                        if _aux_inputs and has_real_forward:
                             # Must stay in the autograd graph: the aux term is a
                             # training loss. The old no_grad() here made L_align
                             # a constant even when teacher hidden states existed.
-                            _s = m.student(**{k: v for k, v in inputs.items()
-                                              if k in ("input_ids", "attention_mask", "position_ids")},
-                                           output_hidden_states=True, use_cache=False)
+                            _s = m.student(**_aux_inputs, output_hidden_states=True,
+                                           use_cache=False)
                             s_hidden = getattr(_s, "hidden_states", None)
-                    except Exception:
+                    except Exception as _e:
                         s_hidden = None
+                        if not getattr(self, "_aux_err_logged", False):
+                            self._aux_err_logged = True
+                            print(f"[twyd] L_align student re-forward FAILED: "
+                                  f"{type(_e).__name__}: {_e}", flush=True)
+                if t_hidden is not None and s_hidden is not None:
+                    _ls = s_hidden[0].shape[1]
+                    if t_hidden[0].shape[1] != _ls:
+                        t_hidden = tuple(t[:, :_ls] for t in t_hidden)
                 if s_hidden is not None and t_hidden is not None and len(s_hidden) and len(t_hidden):
                     # Eq.7 hidden part: 1/L Σ_l ||h^S_l P - h^T_l||^2, averaged
                     # over L matched layers (not just the last). P is one
@@ -273,7 +301,12 @@ class LrcDistillLoss(_BaseLoss):
                             if is_sft and shift_y is not None:
                                 pr = pred[..., :-1, :].contiguous()
                                 tg = th[..., :-1, :].contiguous()
-                                mm = (shift_y != -100).unsqueeze(-1).to(pr.dtype)
+                                # shift_y spans the full training window; the aux
+                                # window may be truncated (max_aux_seq), so slice it.
+                                _sy = shift_y
+                                if _sy.shape[-1] != pr.shape[1] + 1:
+                                    _sy = _sy[..., : pr.shape[1] + 1]
+                                mm = (_sy != -100).unsqueeze(-1).to(pr.dtype)
                                 term = (((pr - tg.float()) ** 2) * mm).sum() / mm.sum().clamp_min(1.0)
                             else:
                                 term = F.mse_loss(pred.float(), th.float())
@@ -288,8 +321,21 @@ class LrcDistillLoss(_BaseLoss):
                             self._aux_logged = True
                             print(f"[twyd] L_align active: layers={idxs} "
                                   f"P={None if P is None else tuple(P.shape)}", flush=True)
-            except Exception:
+                    elif not getattr(self, "_aux_skip_logged", False):
+                        # Silent drops are how the old aux term went missing for
+                        # a whole study: say WHY instead of skipping quietly.
+                        self._aux_skip_logged = True
+                        _sd = None if s_hidden is None else (len(s_hidden), tuple(s_hidden[-1].shape))
+                        _td = None if t_hidden is None else (len(t_hidden), tuple(t_hidden[-1].shape))
+                        print(f"[twyd] L_align SKIPPED: s_hidden={_sd} t_hidden={_td} "
+                              f"P={None if P is None else tuple(P.shape)} idxs={idxs} "
+                              f"use_aux={use_aux} lam={lam}", flush=True)
+            except Exception as _e:
                 aux = None
+                if not getattr(self, "_aux_err_logged", False):
+                    self._aux_err_logged = True
+                    print(f"[twyd] L_align DISABLED this run: {type(_e).__name__}: {_e}",
+                          flush=True)
             if aux is not None and torch.isfinite(aux):
                 loss = loss + lam * aux
         try:

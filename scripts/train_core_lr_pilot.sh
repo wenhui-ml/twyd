@@ -153,10 +153,17 @@ else
   case "$WARM_START" in
     base|pt_ckpt|ridge_ckpt) : ;;
     *)
-      if [ "${USE_AUX:-1}" = "1" ]; then
+      # NOTE: this guard exists for debug smokes with a random slice init, but the PT
+      # recipe in this study *is* GATE=0 + WARM_START=slice (PT repairs the init), so a
+      # real aux arm must be able to opt out. Before 2026-11-13 the message below said
+      # "override with USE_AUX=1" while the export silently won - the aux arm ran with
+      # alignment OFF and looked like a plain duplicate of the non-aux run.
+      if [ "${USE_AUX:-1}" = "1" ] && [ "${AUX_FORCE:-0}" != "1" ]; then
         echo "[gate] aux loss is meaningless on an ungated (random) student;"
-        echo "       forcing USE_AUX=0 for this smoke (override with USE_AUX=1)."
+        echo "       forcing USE_AUX=0. Pass AUX_FORCE=1 to override."
         export TWYD_USE_AUX=0
+      elif [ "${USE_AUX:-1}" = "1" ]; then
+        echo "[gate] AUX_FORCE=1: keeping the Eq.7 alignment term ON despite the ungated init."
       fi
       ;;
   esac

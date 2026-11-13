@@ -1241,6 +1241,14 @@ def _twyd_kw(args) -> dict:
             kw["max_aux_layers"] = int(mx)
         except Exception:
             pass
+    # Alignment window: the aux term does not need the full training context, and a
+    # full-length re-forward with output_hidden_states costs ~2 GiB (bug 8).
+    ms_ = _os.environ.get("TWYD_MAX_AUX_SEQ", None)
+    if ms_ is not None and ms_ != "":
+        try:
+            kw["max_aux_seq"] = int(ms_)
+        except Exception:
+            pass
     return kw
 
 

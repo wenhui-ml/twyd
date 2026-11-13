@@ -21,7 +21,7 @@ echo "[aux] GPU free, start $(date '+%F %H:%M')"
 
 OUT="$ROOT/output/product/pt-mixed-aux-500s"
 env PYTORCH_HIP_ALLOC_CONF=expandable_segments:True PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  GPU=0,1 NPROC=2 SEQ=2048 SAVE_STEPS=800 BS=1 GAS=32 GATE=0 USE_AUX=1 STAGE=pt \
+  GPU=0,1 NPROC=2 SEQ=2048 SAVE_STEPS=800 BS=1 GAS=32 GATE=0 USE_AUX=1 AUX_FORCE=1 STAGE=pt \
   DATA="$ROOT/data/pt_mixed.jsonl" PLANS=0-2,11-13 \
   LORA_MODULES=gate_proj,up_proj SEED=42 BRANCH=core K=64 LORA_MODE=core FACTORIZED=1 \
   FREEZE_COL=true PERP_BASIS=teacher TOKENS=500000000 WARM_START=slice OUTROOT="$OUT" \
