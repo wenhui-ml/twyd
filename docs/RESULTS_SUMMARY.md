@@ -22,6 +22,7 @@ d_ff 8192 / head_dim 128** (1,606M), i.e. the paper's architecture.
 | **PT-mixed 500M (kno+web) + SFT 78M** | **578M** | **.6674** | **+1.24** | **.5065** | **+0.89 pt, p=1.3e-06** |
 | PT-mixed 500M only (no SFT) | 500M | .6646 | +0.96 | **.5083** | +0.75 pt, p=2.1e-05 |
 | **PT-mixed 500M + SFT 78M, data order shuffled** (replication) | **578M** | **.6655** | **+1.05** | **.5099** | **+0.88 pt, p=2.2e-06** |
+| PT-mixed + SFT with KD+aux instead of CE (`dist9`) | 578M | .6603 | +0.53 | .5050 | +0.49 pt, p=0.013 - **significantly worse than `mix9`, p=0.018** |
 | PT-mixed + SFT with KD+aux instead of CE () | 578M | .6603 | +0.53 | .5050 | +0.49 pt, p=0.013 (**worse than , p=0.018**) |
 
 *Avg8 = mean of the harness acc_norm where available, else acc (this is the column
