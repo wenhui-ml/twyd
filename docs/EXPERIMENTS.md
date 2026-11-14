@@ -620,6 +620,36 @@ starts at ~61 with clip 1.0, so if the eval lands on top of the PT checkpoint's 
 (.5083 / .6646) the run barely moved and must be re-tuned (lower LR or a smaller KL weight)
 before it counts as evidence either way.
 
+## 4p. SFT with the paper's distillation objective is worse than plain CE: -0.40 pt (2026-11-14)
+
+Arm `paper_DIST9`: the same PT checkpoint, the same 78M SFT tokens, the same 9-layer plan -
+but the SFT loss is the paper's `lrc_distill` (KL T=40 w=1.0 + CE + Eq.7 aux at lambda=0.2,
+normalised, 512-token window, `L_align active: layers=[0,9,19,28] P=(1536,3072)`), instead of
+plain CE. Motivation: our SFT had been CE-only, the third deviation from the paper recipe (4o).
+
+| arm | SFT loss | MMLU (14,042) | 7 behaviour (12,144) | pooled (26,186) | Avg8 |
+|---|---|---:|---:|---:|---:|
+| `LRC-1.5B-Base` | - | .5006 | .6868 | .5870 | .6550 |
+| **`mix9`** (plain CE) | CE | .5065 +0.58 (p=.040) | **+1.24 (p=3.8e-8)** | **+0.89 (p=1.3e-6)** | **.6674** |
+| `dist9` (KD+CE+aux) | KL+CE+aux | .5050 +0.43 (p=.16) | +0.55 (p=.020) | +0.49 (p=.013) | .6603 |
+| head-to-head `mix9` vs `dist9` | | p=.57 | **p=1.6e-3** | **p=.018** | |
+
+Plain CE is better on every pool, and significantly better on behaviour (+0.69 pt) and pooled
+(+0.40 pt). The mechanism is visible in the loss scale: the KL term at T=40 is ~200 while CE is
+~1.2, so after `clip=1.0` the update direction is set by "stay on the teacher's pretraining
+distribution", which is precisely what SFT is supposed to move away from. `dist9`'s behaviour
+gain (+0.55) is less than half of `mix9`'s (+1.24) - the distillation suppressed the conversion
+SFT exists for. Its `token_acc` also drifted down (.688 -> .678) while the CE run held ~.68.
+
+**This closes the recipe-deviation list with a negative answer**: of the three places where we
+had been more conservative than the paper (no aux, no `down_proj`, CE-only SFT), only the
+SFT-stage distillation has been tested, and doing it the paper's way is worse for the
+deployment metric. The remaining untested one is `down_proj` (arm `paper_DP9`, running).
+
+Caveat: this arm changed two things at once (CE->KD and aux on), so the 0.40 pt cannot be
+attributed to KL vs aux separately. Given the loss-scale argument, KL is the likely culprit;
+separating them would need one more 7 h SFT arm (aux only, CE main term).
+
 ## 5. Why more tokens did nothing: the rank ceiling (and the sweep that measures it)
 
 `§1–§2` showed 322M and 524M tokens are indistinguishable, and LoRA r=256 with
