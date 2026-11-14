@@ -1,5 +1,9 @@
 # TWYD compression study — results summary (2026-11-08)
 
+**For an external reader / independent analysis, see [HANDOFF.md](HANDOFF.md)** - it is
+self-contained (setup, every arm, all p-values, bug list, statistics caveats, running job,
+open hypotheses) and needs no access to the working session.
+
 One-page digest of `docs/EXPERIMENTS.md`. All numbers are measured on this box
 (2 × 24 GB ROCm), paper-8 suite: ARC-C, ARC-E, BoolQ, CSQA, PIQA, SciQ, WinoG, MMLU,
 0-shot, `acc_norm` where the task has it, n = 26,186 items. Teacher =
