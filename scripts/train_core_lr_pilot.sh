@@ -98,10 +98,11 @@ export TWYD_TEACHER="$TEACHER"
 export TWYD_R="$R"
 export TWYD_STAGE="$STAGE"
 export TWYD_WARM_START="$WARM_START"
-export TWYD_T=40.0
-export TWYD_LAM=0.2
+export TWYD_T=${TWYD_T:-40.0}
+export TWYD_WKL=${TWYD_WKL:-1.0}
+export TWYD_LAM=${TWYD_LAM:-0.2}
 export TWYD_USE_AUX="$USE_AUX"
-export TWYD_TARGET_MODULES='gate_proj,up_proj,down_proj'
+export TWYD_TARGET_MODULES=${TWYD_TARGET_MODULES:-'gate_proj,up_proj,down_proj'}
 export TWYD_LORA_RANK="$K"
 export TWYD_LORA_ALPHA="$ALPHA"
 export TWYD_LORA_MODE="$LORA_MODE"
@@ -111,6 +112,16 @@ export TWYD_FREEZE_COL=${FREEZE_COL:-true}
 export TWYD_RANK_MAP="$RANK_MAP"
 export TWYD_FACTORIZED="$FACTORIZED"
 export TWYD_PERP_BASIS="$PERP_BASIS"
+export TWYD_KL_TOPK=${TWYD_KL_TOPK:-0}
+export TWYD_RHO_KEEP=${TWYD_RHO_KEEP:-1.0}
+export TWYD_RHO_MIN_WEIGHT=${TWYD_RHO_MIN_WEIGHT:-0.1}
+export TWYD_UNFREEZE_ATTN=${TWYD_UNFREEZE_ATTN:-0}
+export TWYD_UNFREEZE_NORM=${TWYD_UNFREEZE_NORM:-0}
+export TWYD_WRITER_LR_SCALE=${TWYD_WRITER_LR_SCALE:-1.0}
+export TWYD_WRITER_GRAD_SCALE=${TWYD_WRITER_GRAD_SCALE:-1.0}
+export TWYD_WRITER_MAX_NORM=${TWYD_WRITER_MAX_NORM:-0.0}
+export TWYD_AUX_TYPE=${TWYD_AUX_TYPE:-mseloss}
+export TWYD_AUX_LAYERS=${TWYD_AUX_LAYERS:-}
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 if [ -n "$PT_CKPT" ]; then export TWYD_PT_CKPT="$PT_CKPT"; fi
 if [ -n "$RIDGE_CKPT" ]; then export TWYD_RIDGE_CKPT="$RIDGE_CKPT"; fi
@@ -122,6 +133,7 @@ echo "branch=$BRANCH lora_mode=$LORA_MODE perp_basis=$PERP_BASIS stage=$STAGE r=
 echo "bs=$BS grad_accum=$GRAD_ACCUM seq=$MAX_LENGTH trunc=$TRUNC tokens/step=$((BS * GRAD_ACCUM * MAX_LENGTH * ${NPROC_PER_NODE:-${WORLD_SIZE:-1}}))"
 echo "teacher=$TEACHER model=$MODEL dataset=$DATASET"
 echo "warm_start=$WARM_START rank_map=${RANK_MAP:-uniform} factorized=$FACTORIZED lora_layers=${LORA_LAYERS:-all} lora_modules=${LORA_MODULES:-all}"
+echo "T=$TWYD_T kl_topk=$TWYD_KL_TOPK rho_keep=$TWYD_RHO_KEEP unfreeze_attn=$TWYD_UNFREEZE_ATTN unfreeze_norm=$TWYD_UNFREEZE_NORM writer_lr_scale=$TWYD_WRITER_LR_SCALE writer_grad_scale=$TWYD_WRITER_GRAD_SCALE aux_type=$TWYD_AUX_TYPE"
 echo "model_type=${MODEL_TYPE:-auto} template=${TEMPLATE:-auto}"
 echo "out=$OUT"
 echo "=============================="
@@ -193,6 +205,9 @@ if [ "${NPROC:-1}" -gt 1 ]; then export NPROC_PER_NODE="${NPROC}"; fi
 DDP_ARGS=()
 if [ "${NPROC:-1}" -gt 1 ] && [ "${DDP_BROADCAST_BUFFERS:-false}" != "true" ]; then
   DDP_ARGS+=(--ddp_broadcast_buffers false)
+fi
+if [ "${NPROC:-1}" -gt 1 ] && [ "${DDP_FIND_UNUSED_PARAMETERS:-false}" != "true" ]; then
+  DDP_ARGS+=(--ddp_find_unused_parameters false)
 fi
 
 "$SWIFT" "$STAGE" \

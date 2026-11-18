@@ -86,7 +86,44 @@ class LrcDistillLoss(_BaseLoss):
         self.lam = float(kw.get("aux_weight", 0.2))
         self.use_aux = bool(kw.get("use_aux", True))
         self._aux_norm = bool(kw.get("aux_norm", False))
+        self.aux_loss_type = str(kw.get("aux_loss_type", "mseloss") or "mseloss").lower()
+        self.aux_layers = str(kw.get("aux_layers", "") or "")
+        self.kl_topk = int(kw.get("kl_topk", 0) or 0)
+        self.rho_keep = float(kw.get("rho_keep", 1.0) if kw.get("rho_keep") is not None else 1.0)
+        self.rho_min_weight = float(kw.get("rho_min_weight", 0.1) if kw.get("rho_min_weight") is not None else 0.1)
         self.stage = str(kw.get("stage", "pt")).lower()
+        self._wire_optimizer_groups(trainer)
+
+    def _wire_optimizer_groups(self, trainer):
+        """Hook trainer.optimizer_callback so Writer/Reader & LoRA LR groups take effect."""
+        try:
+            cb = getattr(trainer, "optimizer_callback", None)
+            if cb is None or getattr(cb, "_twyd_opt_wired", False):
+                return
+            orig_create = cb.create_optimizer
+            loss_self = self
+
+            def _create_optimizer(model=None):
+                m_target = model if model is not None else getattr(trainer, "model", None)
+                w = loss_self._unwrap(m_target) if m_target is not None else None
+                fn = getattr(w, "create_optimizer_param_groups", None)
+                if callable(fn):
+                    t_args = getattr(trainer, "args", None) or getattr(cb, "args", None)
+                    lr = float(getattr(t_args, "learning_rate", 1e-4) or 1e-4)
+                    wd = float(getattr(t_args, "weight_decay", 0.0) or 0.0)
+                    groups = fn(lr=lr, weight_decay=wd)
+                    if groups:
+                        from transformers.trainer import Trainer as HfTrainer
+                        opt_cls, opt_kw = HfTrainer.get_optimizer_cls_and_kwargs(t_args)
+                        print(f"[twyd] custom optimizer param groups: {len(groups)} groups "
+                              f"(lrs={[g.get('lr') for g in groups]})", flush=True)
+                        return opt_cls(groups, **opt_kw)
+                return orig_create(model=model)
+
+            cb.create_optimizer = _create_optimizer
+            cb._twyd_opt_wired = True
+        except Exception:
+            pass
 
     def _unwrap(self, model):
         # Unwrap Swift/Peft chains, but STOP at _TwydWrapper (the layer that
@@ -107,27 +144,36 @@ class LrcDistillLoss(_BaseLoss):
             m = inner() if callable(inner) else inner
         return m
 
-    def _per_pos_kl(self, shift_s, shift_t, T, chunk=256):
+    def _per_pos_kl(self, shift_s, shift_t, T, chunk=256, topk: int = 0):
         """Per-position KL(t||s) in fp32, chunked over the sequence.
 
-        The distillation temperature makes this numerically hostile in bf16:
-        with T=40 the logits are divided down to ~1e-2, while bf16 resolution
-        around log p ~ -log(V) ~ -11.8 (V=128k) is ~5e-2.  So the log-probs
-        carry rounding noise LARGER than the signal, and the ``T*T`` rescaling
-        (1600x) amplifies that noise into the loss.  On a real 1.5B run this
-        produced a *negative* training loss (-3.4) that drifted further
-        negative every step while token_acc looked healthy.
-
-        Fix: do the softmax/kl math in fp32 and chunk the sequence so the
-        [B, S, V] fp32 temporaries stay small.  KL >= 0 is then guaranteed.
+        When ``topk > 0``, computes exact Top-K + 1 Tail-Bucket KL:
+            KL_topK(p_T || p_S) = sum_{i in TopK} p_T(i) log(p_T(i)/p_S(i))
+                                  + p_T(tail) log(p_T(tail)/p_S(tail))
+        collapsing the (V - K) low-probability tail tokens into one bucket so
+        gradients focus on separating competing top-K concepts rather than
+        smoothing 128k background noise tokens.
         """
         V = min(shift_s.size(-1), shift_t.size(-1))
+        use_topk = int(topk or 0)
         outs = []
         for s_c, t_c in zip(shift_s[..., :V].split(chunk, dim=1),
                             shift_t[..., :V].split(chunk, dim=1)):
             logp_s = F.log_softmax(s_c.float() / T, dim=-1)
             logp_t = F.log_softmax(t_c.float() / T, dim=-1)
-            outs.append((logp_t.exp() * (logp_t - logp_s)).sum(dim=-1) * (T * T))
+            if 0 < use_topk < V:
+                logp_t_top, top_idx = torch.topk(logp_t, k=use_topk, dim=-1)
+                logp_s_top = torch.gather(logp_s, dim=-1, index=top_idx)
+                p_t_top = logp_t_top.exp()
+                p_s_top = logp_s_top.exp()
+                p_t_tail = (1.0 - p_t_top.sum(dim=-1)).clamp_min(1e-7)
+                p_s_tail = (1.0 - p_s_top.sum(dim=-1)).clamp_min(1e-7)
+                kl_top = (p_t_top * (logp_t_top - logp_s_top)).sum(dim=-1)
+                kl_tail = p_t_tail * (p_t_tail.log() - p_s_tail.log())
+                kl_pos = (kl_top + kl_tail).clamp_min(0.0) * (T * T)
+                outs.append(kl_pos)
+            else:
+                outs.append((logp_t.exp() * (logp_t - logp_s)).sum(dim=-1) * (T * T))
         return outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
 
     def _masked_mean(self, per_pos, shift_y, loss_scale=None):
@@ -143,6 +189,61 @@ class LrcDistillLoss(_BaseLoss):
                 w = mask
         return (per_pos * w).sum() / w.sum().clamp_min(1.0)
 
+    def _rho_token_weights(self, shift_s, shift_t, shift_y, per_pos_kl, T: float,
+                           rho_keep: float, rho_min_weight: float):
+        """Compute per-token weights via Rho-1 / Teacher-Student Manifold Divergence.
+
+        Tokens where the teacher is confident (not random web noise) AND the
+        student lags behind the teacher (high excess CE + KL divergence) receive
+        weight 1.0; trivial / already-mastered tokens receive ``rho_min_weight``.
+        Zero extra forward passes required.
+        """
+        B, S, V = shift_s.shape
+        if S <= 1:
+            return torch.ones_like(per_pos_kl)
+        with torch.no_grad():
+            ce_s_det = F.cross_entropy(
+                shift_s.detach().float().view(-1, V), shift_y.view(-1), reduction="none"
+            ).view(B, S)
+            ce_t_det = F.cross_entropy(
+                shift_t.detach().float().view(-1, int(shift_t.size(-1))), shift_y.view(-1), reduction="none"
+            ).view(B, S)
+            kl_nats = per_pos_kl.detach().float() / max(T * T, 1.0)
+            score = (ce_s_det - ce_t_det) + kl_nats
+            # Filter out high-entropy teacher noise tokens (top 10% highest teacher CE)
+            flat_t = ce_t_det.reshape(-1)
+            if flat_t.numel() >= 16:
+                q90 = torch.quantile(flat_t, 0.90)
+                score = torch.where(ce_t_det > q90, torch.full_like(score, -1e9), score)
+            w = torch.full_like(score, float(rho_min_weight))
+            k_keep = max(1, min(S, int(round(S * float(rho_keep)))))
+            _, top_pos = torch.topk(score, k=k_keep, dim=-1)
+            w.scatter_(-1, top_pos, 1.0)
+        return w.to(per_pos_kl.dtype)
+
+    @staticmethod
+    def _project_logit_lens(mod, h: torch.Tensor):
+        """Project hidden state h [B, S, d] to vocab logits via detached norm + lm_head."""
+        inner = getattr(mod, "model", mod)
+        norm = getattr(inner, "norm", None)
+        lm_head = getattr(mod, "lm_head", None)
+        if lm_head is None and hasattr(mod, "get_output_embeddings"):
+            try:
+                lm_head = mod.get_output_embeddings()
+            except Exception:
+                lm_head = None
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            return None
+        x = h
+        if norm is not None and hasattr(norm, "weight"):
+            eps = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-5)) or 1e-5)
+            xf = x.float()
+            xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+            nw = norm.weight.detach().to(device=x.device, dtype=x.dtype)
+            x = xf.to(x.dtype) * nw
+        hw = lm_head.weight.detach().to(device=x.device, dtype=x.dtype)
+        return F.linear(x, hw)
+
     def __call__(self, outputs, labels, *, num_items_in_batch=None, loss_scale=None, **kwargs):
         raw_model = self.trainer.model
         _p = _prof_on()
@@ -150,9 +251,19 @@ class LrcDistillLoss(_BaseLoss):
         m = self._unwrap(raw_model)
         twcfg = getattr(m, "twyd_cfg", None) or getattr(raw_model, "twyd_cfg", None)
         T, wKL, wNTP, lam = self.T, self.wKL, self.wNTP, self.lam
+        kl_topk = self.kl_topk
+        rho_keep = self.rho_keep
+        rho_min_w = self.rho_min_weight
+        aux_type = self.aux_loss_type
+        aux_layers_spec = self.aux_layers
         if twcfg is not None:
             T, wKL, wNTP, lam = twcfg.kl_temperature, twcfg.kl_weight, twcfg.ntp_weight, twcfg.aux_weight
             use_aux = twcfg.use_aux
+            kl_topk = int(getattr(twcfg, "kl_topk", kl_topk) or 0)
+            rho_keep = float(getattr(twcfg, "rho_keep", rho_keep) if getattr(twcfg, "rho_keep", None) is not None else rho_keep)
+            rho_min_w = float(getattr(twcfg, "rho_min_weight", rho_min_w) if getattr(twcfg, "rho_min_weight", None) is not None else rho_min_w)
+            aux_type = str(getattr(twcfg, "aux_loss_type", aux_type) or aux_type).lower()
+            aux_layers_spec = str(getattr(twcfg, "aux_layers", aux_layers_spec) or "")
         else:
             use_aux = self.use_aux
         logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
@@ -171,6 +282,7 @@ class LrcDistillLoss(_BaseLoss):
             get_t = getattr(raw_model, "get_teacher_outputs", None)
         if get_t is not None and inputs:
             try:
+                _tt = _tick() if _p else 0.0
                 # Teacher hidden states cost ~428 MB at SEQ=2048 (34 layers x 1x2048x3072
                 # bf16) and OOM'd a 24 GB card; ask for logits only here and fetch the
                 # hidden states from a second, truncated forward inside the aux block.
@@ -184,6 +296,8 @@ class LrcDistillLoss(_BaseLoss):
             except Exception:
                 t_logits = None
         shift_s = logits[..., :-1, :].contiguous()
+        if shift_s.size(1) == 0:
+            return logits.sum() * 0.0
         loss = 0.0
         ntp = None
         stage = self.stage
@@ -191,12 +305,29 @@ class LrcDistillLoss(_BaseLoss):
             stage = str(getattr(twcfg, "stage", stage)).lower()
         is_sft = (stage == "sft")
         shift_y = None
+        shift_t = None
+        per_pos = None
+        if t_logits is not None:
+            _tk = _tick() if _p else 0.0
+            shift_t = t_logits[..., :-1, :].contiguous().detach()
+            per_pos = self._per_pos_kl(shift_s, shift_t, T, topk=kl_topk)  # [B,S-1]
+            if _p:
+                _PROF["t_kl"] += _tock(_tk)
+        use_rho = (not is_sft) and (0.0 < rho_keep < 1.0) and (per_pos is not None)
+        rho_w = None
         if labels is not None:
             shift_y = labels[..., 1:].contiguous()
             _tc = _tick() if _p else 0.0
             if is_sft:
                 ntp = F.cross_entropy(shift_s.view(-1, shift_s.size(-1)),
                                       shift_y.view(-1), ignore_index=-100)
+            elif use_rho:
+                rho_w = self._rho_token_weights(shift_s, shift_t, shift_y, per_pos, T,
+                                                rho_keep, rho_min_w)
+                ce_per_pos = F.cross_entropy(
+                    shift_s.view(-1, shift_s.size(-1)), shift_y.view(-1), reduction="none"
+                ).view_as(rho_w)
+                ntp = (ce_per_pos * rho_w).sum() / rho_w.sum().clamp_min(1.0)
             else:  # pt: labels==input_ids, dense supervision
                 ntp = F.cross_entropy(shift_s.view(-1, shift_s.size(-1)),
                                       shift_y.view(-1))
@@ -204,14 +335,11 @@ class LrcDistillLoss(_BaseLoss):
                 _PROF["t_ce"] += _tock(_tc)
             loss = loss + wNTP * ntp
         kl = None
-        if t_logits is not None:
-            _tk = _tick() if _p else 0.0
-            shift_t = t_logits[..., :-1, :].contiguous().detach()
-            per_pos = self._per_pos_kl(shift_s, shift_t, T)  # [B,S-1]
-            if _p:
-                _PROF["t_kl"] += _tock(_tk)
+        if per_pos is not None:
             if is_sft and shift_y is not None:
                 kl = self._masked_mean(per_pos, shift_y, loss_scale)
+            elif rho_w is not None:
+                kl = (per_pos * rho_w).sum() / rho_w.sum().clamp_min(1.0)
             else:  # pt: every position distills
                 kl = per_pos.mean()
             loss = loss + wKL * kl
@@ -273,70 +401,94 @@ class LrcDistillLoss(_BaseLoss):
                     if t_hidden[0].shape[1] != _ls:
                         t_hidden = tuple(t[:, :_ls] for t in t_hidden)
                 if s_hidden is not None and t_hidden is not None and len(s_hidden) and len(t_hidden):
-                    # Eq.7 hidden part: 1/L Σ_l ||h^S_l P - h^T_l||^2, averaged
-                    # over L matched layers (not just the last). P is one
-                    # least-squares projection shared across layers (no params).
                     L = min(len(s_hidden), len(t_hidden))
-                    # Cap layers to bound the lstsq cost on long contexts.
                     max_aux_layers = int((self.kw or {}).get("max_aux_layers", 4) or 4)
-                    idxs = [round(i * (L - 1) / max(max_aux_layers - 1, 1)) for i in range(min(max_aux_layers, L))]
+                    if aux_layers_spec.strip():
+                        from .config import parse_layer_range as _parse_lr
+                        idxs = sorted(_parse_lr(aux_layers_spec, L))
+                    else:
+                        idxs = [round(i * (L - 1) / max(max_aux_layers - 1, 1))
+                                for i in range(min(max_aux_layers, L))]
                     acc, cnt = 0.0, 0
-                    # Fit P once on the last layer, reuse for all (cheap + stable).
-                    sh0, th0 = s_hidden[-1], t_hidden[-1]
                     P = None
-                    if sh0.shape[-1] != th0.shape[-1]:
-                        P = fit_hidden_projection(
-                            sh0.reshape(-1, sh0.shape[-1]),
-                            th0.reshape(-1, th0.shape[-1]),
-                            int((self.kw or {}).get("max_aux_fit_rows", 1024) or 1024))
-                    for li in idxs:
-                        try:
-                            sh, th = s_hidden[li], t_hidden[li]
-                            pred = sh
-                            if P is not None and sh.shape[-1] != th.shape[-1]:
-                                pred = sh @ P.to(device=sh.device, dtype=sh.dtype)
-                            # Never let mse_loss broadcast a width mismatch: that
-                            # turns L_align into a different (wrong) objective.
-                            if pred.shape != th.shape:
+                    if aux_type == "logit_lens":
+                        st_mod = getattr(m, "student", m)
+                        tc_mod = getattr(m, "teacher", None)
+                        lens_topk = max(kl_topk, 32)
+                        lens_T = min(max(T, 1.0), 4.0)
+                        for li in idxs:
+                            try:
+                                sh, th = s_hidden[li], t_hidden[li]
+                                # Subsample up to 128 tokens to keep mid-layer vocab projection tiny
+                                step_tok = max(1, sh.shape[1] // 128)
+                                sh_sub = sh[:, ::step_tok, :]
+                                th_sub = th[:, ::step_tok, :].detach()
+                                zs_mid = self._project_logit_lens(st_mod, sh_sub)
+                                with torch.no_grad():
+                                    zt_mid = self._project_logit_lens(tc_mod, th_sub) if tc_mod is not None else None
+                                if zs_mid is None or zt_mid is None:
+                                    continue
+                                term = self._per_pos_kl(
+                                    zs_mid, zt_mid, lens_T, chunk=64, topk=lens_topk
+                                ).mean() / (lens_T * lens_T)
+                                if torch.isfinite(term):
+                                    acc = acc + term
+                                    cnt += 1
+                            except Exception:
                                 continue
-                            if is_sft and shift_y is not None:
-                                pr = pred[..., :-1, :].contiguous()
-                                tg = th[..., :-1, :].contiguous()
-                                # shift_y spans the full training window; the aux
-                                # window may be truncated (max_aux_seq), so slice it.
-                                _sy = shift_y
-                                if _sy.shape[-1] != pr.shape[1] + 1:
-                                    _sy = _sy[..., : pr.shape[1] + 1]
-                                mm = (_sy != -100).unsqueeze(-1).to(pr.dtype)
-                                term = (((pr - tg.float()) ** 2) * mm).sum() / mm.sum().clamp_min(1.0)
-                            else:
-                                term = F.mse_loss(pred.float(), th.float())
-                            if self._aux_norm:
-                                # Relative alignment error: ||h^S P - h^T||^2 / ||h^T||^2.
-                                # The absolute MSE on Llama residual streams is O(200)
-                                # because of the norm mismatch between the 1536-d student
-                                # and the 3072-d teacher; with lambda=0.2 that term
-                                # dominated the KL (loss 245 vs 200, grad_norm 113 vs 10)
-                                # and turned every step into a clipped step. Normalising
-                                # keeps the paper's lambda with an O(1) term.
-                                _pf = pred.float()
-                                _tf = th.float()
-                                _num = ((_pf - _tf) ** 2).sum(-1)
-                                _den = (_tf ** 2).sum(-1).clamp_min(1e-6)
-                                term = (_num / _den).mean()
-                            if torch.isfinite(term):
-                                acc = acc + term
-                                cnt += 1
-                        except Exception:
-                            continue
+                    else:
+                        # Eq.7 hidden part: 1/L Σ_l ||h^S_l P - h^T_l||^2, averaged
+                        # over L matched layers (not just the last). P is one
+                        # least-squares projection shared across layers (no params).
+                        sh0, th0 = s_hidden[-1], t_hidden[-1]
+                        if sh0.shape[-1] != th0.shape[-1]:
+                            P = fit_hidden_projection(
+                                sh0.reshape(-1, sh0.shape[-1]),
+                                th0.reshape(-1, th0.shape[-1]),
+                                int((self.kw or {}).get("max_aux_fit_rows", 1024) or 1024))
+                        for li in idxs:
+                            try:
+                                sh, th = s_hidden[li], t_hidden[li]
+                                pred = sh
+                                if P is not None and sh.shape[-1] != th.shape[-1]:
+                                    pred = sh @ P.to(device=sh.device, dtype=sh.dtype)
+                                # Never let mse_loss broadcast a width mismatch: that
+                                # turns L_align into a different (wrong) objective.
+                                if pred.shape != th.shape:
+                                    continue
+                                if is_sft and shift_y is not None:
+                                    pr = pred[..., :-1, :].contiguous()
+                                    tg = th[..., :-1, :].contiguous()
+                                    # shift_y spans the full training window; the aux
+                                    # window may be truncated (max_aux_seq), so slice it.
+                                    _sy = shift_y
+                                    if _sy.shape[-1] != pr.shape[1] + 1:
+                                        _sy = _sy[..., : pr.shape[1] + 1]
+                                    mm = (_sy != -100).unsqueeze(-1).to(pr.dtype)
+                                    term = (((pr - tg.float()) ** 2) * mm).sum() / mm.sum().clamp_min(1.0)
+                                else:
+                                    term = F.mse_loss(pred.float(), th.float())
+                                if self._aux_norm:
+                                    # Relative alignment error: ||h^S P - h^T||^2 / ||h^T||^2.
+                                    _pf = pred.float()
+                                    _tf = th.float()
+                                    _num = ((_pf - _tf) ** 2).sum(-1)
+                                    _den = (_tf ** 2).sum(-1).clamp_min(1e-6)
+                                    term = (_num / _den).mean()
+                                if torch.isfinite(term):
+                                    acc = acc + term
+                                    cnt += 1
+                            except Exception:
+                                continue
                     if cnt > 0:
                         aux = acc / cnt
                         if not getattr(self, "_aux_logged", False):
                             self._aux_logged = True
-                            print(f"[twyd] L_align active: layers={idxs} "
+                            _av = float(aux.detach()) if torch.is_tensor(aux) else float(aux)
+                            print(f"[twyd] L_align active ({aux_type}): layers={idxs} "
                                   f"P={None if P is None else tuple(P.shape)} "
-                                  f"aux={float(aux):.4g} lam={lam} "
-                                  f"lam*aux={lam * float(aux):.4g} norm={self._aux_norm}", flush=True)
+                                  f"aux={_av:.4g} lam={lam} "
+                                  f"lam*aux={lam * _av:.4g} norm={self._aux_norm}", flush=True)
                     elif not getattr(self, "_aux_skip_logged", False):
                         # Silent drops are how the old aux term went missing for
                         # a whole study: say WHY instead of skipping quietly.
@@ -388,9 +540,11 @@ class LrcDistillLoss(_BaseLoss):
             except Exception:
                 _rank = 0
             if _rank == 0:
-                _kl = float(kl) if kl is not None else float("nan")
+                _kl = float(kl.detach()) if torch.is_tensor(kl) else (float(kl) if kl is not None else float("nan"))
+                _ntp = float(ntp.detach()) if torch.is_tensor(ntp) else float(ntp)
+                _ls = float(loss.detach()) if torch.is_tensor(loss) else float(loss)
                 # `kl` already carries the T^2 factor from _per_pos_kl, so do NOT
                 # multiply again; report the raw nats too for interpretability.
-                print(f"[twyd] ce={float(ntp):.4f} kl_raw={_kl / (T * T):.6f} "
-                      f"klT2={wKL * _kl:.2f} loss={float(loss):.2f}", flush=True)
+                print(f"[twyd] ce={_ntp:.4f} kl_raw={_kl / (T * T):.6f} "
+                      f"klT2={wKL * _kl:.2f} loss={_ls:.2f}", flush=True)
         return loss

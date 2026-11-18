@@ -29,7 +29,16 @@ class TwydLRCConfig:
     ntp_weight: float = 1.0
     aux_weight: float = 0.2
     use_aux: bool = True
-    aux_loss_type: str = "mseloss"
+    aux_loss_type: str = "mseloss"  # mseloss | l1 | logit_lens
+    aux_layers: str = ""            # explicit mid-layer indices for L_align, e.g. "6,12,16,19"
+    kl_topk: int = 0                # >0 enables Top-K + tail-bucket KL
+    rho_keep: float = 1.0           # <1.0 enables Rho-1 excess-loss token selection
+    rho_min_weight: float = 0.1     # floor weight for non-selected tokens in Rho-1
+    unfreeze_attn: bool = False     # unfreeze q/k/v/o_proj in active layers (Full-Bus)
+    unfreeze_norm: bool = False     # unfreeze RMSNorm in active layers
+    writer_lr_scale: float = 1.0    # LR multiplier for Writer projections (down_proj, o_proj)
+    writer_grad_scale: float = 1.0  # grad multiplier for Writer projections before global clip
+    writer_max_norm: float = 0.0    # per-tensor grad norm clamp for Writer projections
     ridge_lambda: Optional[float] = None
     ridge_perp: str = "residual"  # zero | residual | lowrank (ridge warm start)
     master_p: str = "none"        # none | embed_svd (project before ridge)
@@ -52,7 +61,7 @@ class TwydLRCConfig:
 
     def validate(self) -> None:
         assert self.branch in ("dense", "core", "plain"), f"branch={self.branch}"
-        assert self.aux_loss_type in ("mseloss", "l1"), self.aux_loss_type
+        assert self.aux_loss_type in ("mseloss", "l1", "logit_lens"), self.aux_loss_type
         assert self.stage in ("pt", "sft"), f"stage={self.stage}"
         assert self.warm_start in ("slice", "pt_ckpt", "ridge", "ridge_ckpt", "base"), \
             f"warm_start={self.warm_start}"

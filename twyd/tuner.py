@@ -463,6 +463,40 @@ class _TwydWrapper(nn.Module):
     def parameters(self, *args, **kwargs):
         return self.student.parameters(*args, **kwargs)
 
+    def create_optimizer_param_groups(self, lr: float = 1e-4, weight_decay: float = 0.0, **kwargs):
+        """Build custom AdamW parameter groups for Writer/Reader and LoRA LR decoupling.
+
+        Returns None when all multipliers are default (1.0 / None) so standard
+        single-LR trainer paths remain untouched unless decoupling is active.
+        """
+        cfg = getattr(self, "twyd_cfg", None)
+        writer_scale = float(getattr(cfg, "writer_lr_scale", 1.0) or 1.0) if cfg else 1.0
+        lora_lr = getattr(cfg, "lora_lr", None) if cfg else None
+        if abs(writer_scale - 1.0) < 1e-9 and lora_lr is None:
+            return None
+        base_lr = float(lr)
+        groups = {}
+        for n, p in self.student.named_parameters():
+            if not p.requires_grad:
+                continue
+            lname = n.lower()
+            no_decay = ("bias" in lname or "norm" in lname or "layernorm" in lname)
+            wd = 0.0 if no_decay else float(weight_decay)
+            is_lora = ("lora_a" in lname or "lora_b" in lname or "z_perp" in lname)
+            is_bus_sensitive = any(w in lname for w in (
+                "down_proj", "o_proj", "q_proj", "k_proj", "v_proj", "w2", "c_proj", "norm"
+            ))
+            if is_lora and lora_lr is not None:
+                p_lr = float(lora_lr) * (writer_scale if is_bus_sensitive else 1.0)
+            elif is_bus_sensitive:
+                p_lr = base_lr * writer_scale
+            else:
+                p_lr = base_lr
+            key = (round(p_lr, 12), round(wd, 8))
+            groups.setdefault(key, []).append(p)
+        return [{"params": ps, "lr": k_lr, "weight_decay": k_wd}
+                for (k_lr, k_wd), ps in groups.items() if ps]
+
     def forward(self, *args, **kwargs):
         # Cache last student inputs so LrcDistillLoss can run the frozen
         # teacher on the same batch (ms-swift strips inputs before loss_fn).
@@ -873,6 +907,11 @@ def _freeze_for_branch(wrapper, cfg) -> None:
     lora_layers_spec = str(getattr(cfg, "lora_layers", "") or "")
     sel_projs = {s.strip() for s in str(getattr(cfg, "lora_modules", "") or "").split(",")
                  if s.strip()}
+    unfreeze_attn = bool(getattr(cfg, "unfreeze_attn", False))
+    unfreeze_norm = bool(getattr(cfg, "unfreeze_norm", False))
+    writer_grad_scale = float(getattr(cfg, "writer_grad_scale", 1.0) or 1.0)
+    writer_max_norm = float(getattr(cfg, "writer_max_norm", 0.0) or 0.0)
+    attn_names = ("q_proj", "k_proj", "v_proj", "o_proj")
     # Direction 1 (Fig.8b): when lora_layers is set, ONLY those layers train;
     # everything else stays frozen plain (zero grad, zero optimizer state).
     try:
@@ -891,11 +930,18 @@ def _freeze_for_branch(wrapper, cfg) -> None:
             _li = None
         if layer_active and _li is not None and _li not in lora_layer_set:
             continue  # deep frozen-plain layers: keep requires_grad False
+        # Full-Bus extension: optionally unfreeze Attention (q/k/v/o) and RMSNorm
+        # in the active layers so the 1536-d residual coordinate system can co-adapt.
+        if unfreeze_norm and ("layernorm" in lname or ".norm." in lname or lname.endswith("norm.weight")):
+            p.requires_grad_(True)
+            continue
         parts = n.split(".")
         short = parts[-2] if len(parts) >= 2 else ""
-        if sel_projs and short not in sel_projs:
+        if unfreeze_attn and short in attn_names:
+            p.requires_grad_(True)
+        elif sel_projs and short not in sel_projs:
             continue  # projection-level selection: keep this projection frozen
-        if cfg.branch == "dense":
+        elif cfg.branch == "dense":
             # full dense-lrc: 整块 deployed 权重可训；
             # LoRA-Dense: 只训 lora_A/lora_B，base_weight 保持冻结。
             if lora_rank > 0:
@@ -914,6 +960,27 @@ def _freeze_for_branch(wrapper, cfg) -> None:
                 p.requires_grad_(not _freeze_col)
             elif "z_perp" in n or "lora_a" in lname or "lora_b" in lname:
                 p.requires_grad_(True)
+        # Bus-sensitive gradient decoupling: prevent down_proj / Attention (2.5-3.6x
+        # larger grad_norm) from dominating global max_grad_norm and starving gate/up.
+        if p.requires_grad and any(w in lname for w in (
+            "down_proj", "o_proj", "q_proj", "k_proj", "v_proj", "w2", "c_proj"
+        )):
+            if (abs(writer_grad_scale - 1.0) > 1e-6 or writer_max_norm > 0.0) and not getattr(p, "_twyd_writer_hooked", False):
+                _scale = writer_grad_scale
+                _mmax = writer_max_norm
+                def _writer_hook(g, s=_scale, m=_mmax):
+                    if g is None:
+                        return None
+                    out_g = g
+                    if m > 0.0:
+                        gn = out_g.float().norm()
+                        if gn > m:
+                            out_g = out_g * (m / (gn + 1e-6)).to(out_g.dtype)
+                    if abs(s - 1.0) > 1e-6:
+                        out_g = out_g * s
+                    return out_g
+                p.register_hook(_writer_hook)
+                p._twyd_writer_hooked = True
     for p in wrapper.teacher.parameters():
         p.requires_grad_(False)
 
@@ -1186,6 +1253,16 @@ def _twyd_kw(args) -> dict:
         "rank_map": _os.environ.get("TWYD_RANK_MAP", None),
         "factorized": _os.environ.get("TWYD_FACTORIZED", None),
         "perp_basis": _os.environ.get("TWYD_PERP_BASIS", None),
+        "aux_loss_type": _os.environ.get("TWYD_AUX_TYPE", None),
+        "aux_layers": _os.environ.get("TWYD_AUX_LAYERS", None),
+        "kl_topk": _os.environ.get("TWYD_KL_TOPK", None),
+        "rho_keep": _os.environ.get("TWYD_RHO_KEEP", None),
+        "rho_min_weight": _os.environ.get("TWYD_RHO_MIN_WEIGHT", None),
+        "unfreeze_attn": _os.environ.get("TWYD_UNFREEZE_ATTN", None),
+        "unfreeze_norm": _os.environ.get("TWYD_UNFREEZE_NORM", None),
+        "writer_lr_scale": _os.environ.get("TWYD_WRITER_LR_SCALE", None),
+        "writer_grad_scale": _os.environ.get("TWYD_WRITER_GRAD_SCALE", None),
+        "writer_max_norm": _os.environ.get("TWYD_WRITER_MAX_NORM", None),
     }
     for k, v in env_map.items():
         if v is None or (isinstance(v, str) and v == ""):
@@ -1198,14 +1275,15 @@ def _twyd_kw(args) -> dict:
         except Exception:
             return x
 
-    for k in ("student_hidden", "outlier_keep", "lora_rank",
+    for k in ("student_hidden", "outlier_keep", "lora_rank", "kl_topk",
               "calib_num_seqs", "calib_seq_len", "calib_batch_size"):
         if k in kw and isinstance(kw[k], str):
             try:
                 kw[k] = int(kw[k])
             except Exception:
                 pass
-    for k in ("lora_alpha", "lora_lr",):
+    for k in ("lora_alpha", "lora_lr", "rho_keep", "rho_min_weight",
+              "writer_lr_scale", "writer_grad_scale", "writer_max_norm"):
         if k in kw and isinstance(kw[k], str):
             try:
                 kw[k] = float(kw[k])
@@ -1214,14 +1292,10 @@ def _twyd_kw(args) -> dict:
     for k in ("kl_temperature", "kl_weight", "ntp_weight", "aux_weight", "ridge_lambda"):
         if k in kw and isinstance(kw[k], str):
             kw[k] = _num(kw[k])
-    if "use_aux" in kw and isinstance(kw["use_aux"], str):
-        kw["use_aux"] = kw["use_aux"].strip().lower() not in ("0", "false", "no", "off")
-    if "calib_joint" in kw and isinstance(kw["calib_joint"], str):
-        kw["calib_joint"] = kw["calib_joint"].strip().lower() not in ("0", "false", "no", "off")
-    if "freeze_col" in kw and isinstance(kw["freeze_col"], str):
-        kw["freeze_col"] = kw["freeze_col"].strip().lower() not in ("0", "false", "no", "off")
-    if "factorized" in kw and isinstance(kw["factorized"], str):
-        kw["factorized"] = kw["factorized"].strip().lower() not in ("0", "false", "no", "off")
+    for bkey in ("use_aux", "calib_joint", "freeze_col", "factorized",
+                 "unfreeze_attn", "unfreeze_norm"):
+        if bkey in kw and isinstance(kw[bkey], str):
+            kw[bkey] = kw[bkey].strip().lower() not in ("0", "false", "no", "off")
     if "target_modules" in kw and isinstance(kw["target_modules"], str):
         _tm_raw = kw["target_modules"].strip()
         # Accept both comma-separated (gate_proj,up_proj) and JSON-like
@@ -1269,7 +1343,16 @@ def _prepare_model_impl(args, model, branch: str):
               ntp_weight=kw.get("ntp_weight", 1.0),
               aux_weight=kw.get("aux_weight", 0.2),
               use_aux=kw.get("use_aux", True),
-              aux_loss_type=kw.get("aux_loss_type", "mseloss"),
+              aux_loss_type=str(kw.get("aux_loss_type", "mseloss") or "mseloss").lower(),
+              aux_layers=str(kw.get("aux_layers", "") or ""),
+              kl_topk=int(kw.get("kl_topk", 0) or 0),
+              rho_keep=float(kw.get("rho_keep", 1.0) if kw.get("rho_keep") is not None else 1.0),
+              rho_min_weight=float(kw.get("rho_min_weight", 0.1) if kw.get("rho_min_weight") is not None else 0.1),
+              unfreeze_attn=bool(kw.get("unfreeze_attn", False)),
+              unfreeze_norm=bool(kw.get("unfreeze_norm", False)),
+              writer_lr_scale=float(kw.get("writer_lr_scale", 1.0) if kw.get("writer_lr_scale") is not None else 1.0),
+              writer_grad_scale=float(kw.get("writer_grad_scale", 1.0) if kw.get("writer_grad_scale") is not None else 1.0),
+              writer_max_norm=float(kw.get("writer_max_norm", 0.0) if kw.get("writer_max_norm") is not None else 0.0),
               ridge_lambda=kw.get("ridge_lambda"),
               ridge_perp=str(kw.get("ridge_perp", "residual") or "residual").lower(),
               master_p=str(kw.get("master_p", "none") or "none").lower(),
