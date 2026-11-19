@@ -60,7 +60,7 @@ class TwydLRCConfig:
     perp_basis: str = "teacher"  # teacher | col (col = P6 equal-parameter control)
 
     def validate(self) -> None:
-        assert self.branch in ("dense", "core", "plain"), f"branch={self.branch}"
+        assert self.branch in ("dense", "core", "plain", "moe"), f"branch={self.branch}"
         assert self.aux_loss_type in ("mseloss", "l1", "logit_lens"), self.aux_loss_type
         assert self.stage in ("pt", "sft"), f"stage={self.stage}"
         assert self.warm_start in ("slice", "pt_ckpt", "ridge", "ridge_ckpt", "base"), \

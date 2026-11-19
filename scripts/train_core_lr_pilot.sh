@@ -134,6 +134,9 @@ echo "bs=$BS grad_accum=$GRAD_ACCUM seq=$MAX_LENGTH trunc=$TRUNC tokens/step=$((
 echo "teacher=$TEACHER model=$MODEL dataset=$DATASET"
 echo "warm_start=$WARM_START rank_map=${RANK_MAP:-uniform} factorized=$FACTORIZED lora_layers=${LORA_LAYERS:-all} lora_modules=${LORA_MODULES:-all}"
 echo "T=$TWYD_T kl_topk=$TWYD_KL_TOPK rho_keep=$TWYD_RHO_KEEP unfreeze_attn=$TWYD_UNFREEZE_ATTN unfreeze_norm=$TWYD_UNFREEZE_NORM writer_lr_scale=$TWYD_WRITER_LR_SCALE writer_grad_scale=$TWYD_WRITER_GRAD_SCALE aux_type=$TWYD_AUX_TYPE"
+if [ "$BRANCH" = "moe" ]; then
+  echo "moe: layers=${TWYD_MOE_LAYERS:-8-23} experts=${TWYD_MOE_EXPERTS:-8} topk=${TWYD_MOE_TOPK:-2} inter=${TWYD_MOE_INTER:-1536} lb=${TWYD_MOE_LB_COEF:-0.02} z=${TWYD_MOE_Z_COEF:-0.001} router_lr_scale=${TWYD_MOE_ROUTER_LR_SCALE:-2.0} unfreeze_shared=${TWYD_MOE_UNFREEZE_SHARED:-0}"
+fi
 echo "model_type=${MODEL_TYPE:-auto} template=${TEMPLATE:-auto}"
 echo "out=$OUT"
 echo "=============================="

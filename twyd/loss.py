@@ -543,8 +543,23 @@ class LrcDistillLoss(_BaseLoss):
                 _kl = float(kl.detach()) if torch.is_tensor(kl) else (float(kl) if kl is not None else float("nan"))
                 _ntp = float(ntp.detach()) if torch.is_tensor(ntp) else float(ntp)
                 _ls = float(loss.detach()) if torch.is_tensor(loss) else float(loss)
+                # Report MoE router balance diagnostics when TwydSharedRoutedMoE layers exist.
+                _moe_str = ""
+                try:
+                    _st = getattr(m, "student", m)
+                    _loads, _lbs = [], []
+                    for _mod in _st.modules():
+                        if hasattr(_mod, "last_load") and _mod.last_load is not None:
+                            _loads.append(_mod.last_load)
+                            _lbs.append(float(getattr(_mod, "last_aux_val", 0.0)))
+                    if _loads:
+                        _avg_load = torch.stack(_loads, dim=0).mean(dim=0)
+                        _moe_str = (f" moe_aux={sum(_lbs)/len(_lbs):.4f} "
+                                    f"load=[{float(_avg_load.min()):.3f}..{float(_avg_load.max()):.3f}]")
+                except Exception:
+                    pass
                 # `kl` already carries the T^2 factor from _per_pos_kl, so do NOT
                 # multiply again; report the raw nats too for interpretability.
                 print(f"[twyd] ce={_ntp:.4f} kl_raw={_kl / (T * T):.6f} "
-                      f"klT2={wKL * _kl:.2f} loss={_ls:.2f}", flush=True)
+                      f"klT2={wKL * _kl:.2f} loss={_ls:.2f}{_moe_str}", flush=True)
         return loss

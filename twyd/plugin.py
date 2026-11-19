@@ -1,5 +1,6 @@
 """One-import registration for ms-swift: --external_plugins twyd.plugin."""
 from .loss import LrcDistillLoss
+from .moe import MoeLRCAdapter
 from .tuner import CoreLRCAdapter, DenseLRCAdapter, PlainLRCAdapter
 
 try:
@@ -35,7 +36,12 @@ try:
 except Exception:  # transformers not available at import time
     TwydInputCacheCallback = None  # type: ignore
 
-_TUNERS = {"dense_lrc": DenseLRCAdapter, "core_lrc": CoreLRCAdapter, "plain_lrc": PlainLRCAdapter}
+_TUNERS = {
+    "dense_lrc": DenseLRCAdapter,
+    "core_lrc": CoreLRCAdapter,
+    "plain_lrc": PlainLRCAdapter,
+    "moe_lrc": MoeLRCAdapter,
+}
 _LOSSES = {"lrc_distill": LrcDistillLoss}
 
 try:
