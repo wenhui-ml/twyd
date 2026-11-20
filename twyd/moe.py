@@ -153,6 +153,23 @@ def save_twyd_moe_pretrained(model, save_directory: str, safe_serialization: boo
     return save_directory
 
 
+def _detect_moe_ckpt_cfg(pt_ckpt: str | None) -> dict | None:
+    """Return TwydMoE config dict if pt_ckpt is already an exported TwydMoE dir."""
+    if not pt_ckpt or not os.path.isdir(str(pt_ckpt)):
+        return None
+    cfg_path = os.path.join(str(pt_ckpt), "config.json")
+    if not os.path.isfile(cfg_path):
+        return None
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("model_type") == "twyd_moe" and d.get("moe_layers"):
+            return d
+    except Exception:
+        return None
+    return None
+
+
 class MoeLRCAdapter(_TunerBase):
     branch = "moe"
 
@@ -197,21 +214,50 @@ class MoeLRCAdapter(_TunerBase):
             student = _shrink_student_(student, teacher, r, attn_impl=attn_impl)
 
         pt_ckpt = kw.get("pt_ckpt", None)
-        if _pt_ckpt_action(cfg, pt_ckpt) == "load":
-            _apply_pt_ckpt_(student, pt_ckpt, cfg.stage,
-                            strict=os.environ.get("TWYD_PT_CKPT_STRICT", "1") != "0")
+        load_ckpt = (_pt_ckpt_action(cfg, pt_ckpt) == "load")
+        ckpt_moe_cfg = _detect_moe_ckpt_cfg(pt_ckpt) if load_ckpt else None
 
         n_layers = int(getattr(getattr(student, "config", None), "num_hidden_layers", 28) or 28)
-        layer_list = sorted(parse_layer_range(moe_cfg["moe_layers"], n_layers))
-        injected = inject_twyd_moe_(
-            student,
-            moe_layers=layer_list,
-            num_experts=moe_cfg["num_experts"],
-            top_k=moe_cfg["top_k"],
-            moe_intermediate_size=moe_cfg["moe_intermediate_size"],
-            lb_coef=moe_cfg["lb_coef"],
-            z_coef=moe_cfg["z_coef"],
-        )
+        if ckpt_moe_cfg is not None:
+            # Continuing / SFT'ing from an existing TwydMoE checkpoint:
+            # inject matching MoE layout FIRST, then load all shared + routed weights!
+            layer_list = sorted(int(i) for i in ckpt_moe_cfg["moe_layers"])
+            moe_cfg["moe_layers"] = ",".join(str(i) for i in layer_list)
+            moe_cfg["num_experts"] = int(ckpt_moe_cfg.get("num_experts", moe_cfg["num_experts"]))
+            moe_cfg["top_k"] = int(ckpt_moe_cfg.get("num_experts_per_tok", moe_cfg["top_k"]))
+            moe_cfg["moe_intermediate_size"] = int(
+                ckpt_moe_cfg.get("moe_intermediate_size", moe_cfg["moe_intermediate_size"])
+            )
+            injected = inject_twyd_moe_(
+                student,
+                moe_layers=layer_list,
+                num_experts=moe_cfg["num_experts"],
+                top_k=moe_cfg["top_k"],
+                moe_intermediate_size=moe_cfg["moe_intermediate_size"],
+                lb_coef=moe_cfg["lb_coef"],
+                z_coef=moe_cfg["z_coef"],
+            )
+            _apply_pt_ckpt_(student, pt_ckpt, cfg.stage,
+                            strict=os.environ.get("TWYD_PT_CKPT_STRICT", "1") != "0")
+            print(f"[twyd-moe] resumed existing TwydMoE ckpt from {pt_ckpt} "
+                  f"(layers={len(injected)}, E={moe_cfg['num_experts']}, topK={moe_cfg['top_k']})",
+                  flush=True)
+        else:
+            # Upcycling from a Dense mother checkpoint: load Dense weights first,
+            # then wrap selected MLPs with zero-init routed experts (step-0 identity).
+            if load_ckpt:
+                _apply_pt_ckpt_(student, pt_ckpt, cfg.stage,
+                                strict=os.environ.get("TWYD_PT_CKPT_STRICT", "1") != "0")
+            layer_list = sorted(parse_layer_range(moe_cfg["moe_layers"], n_layers))
+            injected = inject_twyd_moe_(
+                student,
+                moe_layers=layer_list,
+                num_experts=moe_cfg["num_experts"],
+                top_k=moe_cfg["top_k"],
+                moe_intermediate_size=moe_cfg["moe_intermediate_size"],
+                lb_coef=moe_cfg["lb_coef"],
+                z_coef=moe_cfg["z_coef"],
+            )
         gas = max(1, int(getattr(args, "gradient_accumulation_steps", 1) or 1))
         for mod in student.modules():
             if isinstance(mod, TwydSharedRoutedMoE):

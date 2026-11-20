@@ -116,3 +116,16 @@ def test_moe_save_and_hf_trust_remote_code_reload(tmp_path, monkeypatch):
     with torch.no_grad():
         z_after = reloaded(input_ids=ids).logits
     assert torch.allclose(z_before, z_after, atol=1e-5), f"max diff={(z_before - z_after).abs().max().item()}"
+
+    # Also verify SFT / continuation warm-start via MoeLRCAdapter.prepare_model(pt_ckpt=out_dir)
+    # preserves all shared + routed weights (including non-zero w_down) bit-exactly!
+    fresh_dense = _tiny_llama()
+    monkeypatch.setenv("TWYD_STAGE", "sft")
+    monkeypatch.setenv("TWYD_WARM_START", "pt_ckpt")
+    monkeypatch.setenv("TWYD_PT_CKPT", out_dir)
+    resumed = MoeLRCAdapter.prepare_model(SimpleNamespace(model="self_fake"), fresh_dense)
+    resumed.student.eval()
+    with torch.no_grad():
+        z_resumed = resumed.student(input_ids=ids).logits
+    assert torch.allclose(z_before, z_resumed, atol=1e-5), f"max diff={(z_before - z_resumed).abs().max().item()}"
+    assert resumed.student.model.layers[1].mlp.w_down.abs().sum() > 0
