@@ -144,6 +144,169 @@ class LrcDistillLoss(_BaseLoss):
             m = inner() if callable(inner) else inner
         return m
 
+    @staticmethod
+    def _chunk_topk_kl_ce(
+        s_c: torch.Tensor,
+        top_idx_c: torch.Tensor,
+        logp_t_top_c: torch.Tensor,
+        p_t_top_c: torch.Tensor,
+        p_t_tail_c: torch.Tensor,
+        y_c: torch.Tensor | None,
+        T: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Fused Top-K + Tail-Bucket KL and CE on one sequence chunk (recomputed under checkpoint)."""
+        V_full = int(s_c.size(-1))
+        logp_s = F.log_softmax(s_c.float() / T, dim=-1)
+        logp_s_top = torch.gather(logp_s, dim=-1, index=top_idx_c)
+        p_s_top = logp_s_top.exp()
+        p_s_tail = (1.0 - p_s_top.sum(dim=-1)).clamp_min(1e-7)
+        kl_top = (p_t_top_c * (logp_t_top_c - logp_s_top)).sum(dim=-1)
+        kl_tail = p_t_tail_c * (p_t_tail_c.log() - p_s_tail.log())
+        kl_c = (kl_top + kl_tail).clamp_min(0.0) * (T * T)
+        if y_c is None:
+            return kl_c, None
+        if abs(T - 1.0) < 1e-6:
+            safe_y = y_c.clamp_min(0)
+            ce_c = -torch.gather(logp_s, dim=-1, index=safe_y.unsqueeze(-1)).squeeze(-1)
+            ce_c = torch.where(y_c != -100, ce_c, torch.zeros_like(ce_c))
+        else:
+            ce_c = F.cross_entropy(
+                s_c.float().reshape(-1, V_full), y_c.reshape(-1),
+                reduction="none", ignore_index=-100,
+            ).view_as(y_c)
+        return kl_c, ce_c
+
+    def _fused_topk_distill(
+        self,
+        shift_s: torch.Tensor,
+        shift_t: torch.Tensor,
+        shift_y: torch.Tensor | None,
+        T: float,
+        topk: int,
+        use_rho: bool,
+        rho_keep: float,
+        rho_min_w: float,
+        chunk: int = 256,
+    ):
+        """Memory-optimal fused Top-K KL + CE + Rho-1 over 128k vocab.
+
+        Compresses the [B, S, V] teacher logits into [B, S, K] targets in no_grad
+        (freeing ~1 GiB immediately) and runs each 256-token student chunk under
+        non-reentrant activation checkpointing so peak loss VRAM is ~0.25 GiB
+        instead of ~4.2 GiB while remaining mathematically equivalent.
+        """
+        from torch.utils.checkpoint import checkpoint as _ckpt
+
+        V = min(int(shift_s.size(-1)), int(shift_t.size(-1)))
+        S = int(shift_s.size(1))
+        B = int(shift_s.size(0))
+        s_v = shift_s[..., :V]
+        t_v = shift_t[..., :V]
+
+        top_idxs, logp_t_tops, p_t_tops, p_t_tails = [], [], [], []
+        ce_t_chunks, ce_s_det_chunks, kl_det_chunks = [], [], []
+
+        with torch.no_grad():
+            for st in range(0, S, chunk):
+                ed = min(S, st + chunk)
+                t_c = t_v[:, st:ed, :]
+                logp_t = F.log_softmax(t_c.float() / T, dim=-1)
+                logp_t_top, top_idx = torch.topk(logp_t, k=topk, dim=-1)
+                p_t_top = logp_t_top.exp()
+                p_t_tail = (1.0 - p_t_top.sum(dim=-1)).clamp_min(1e-7)
+                top_idxs.append(top_idx)
+                logp_t_tops.append(logp_t_top)
+                p_t_tops.append(p_t_top)
+                p_t_tails.append(p_t_tail)
+
+                if use_rho and shift_y is not None:
+                    y_c = shift_y[:, st:ed]
+                    s_c = s_v[:, st:ed, :].detach()
+                    if abs(T - 1.0) < 1e-6:
+                        safe_y = y_c.clamp_min(0)
+                        ce_t_c = -torch.gather(logp_t, dim=-1, index=safe_y.unsqueeze(-1)).squeeze(-1)
+                        ce_t_c = torch.where(y_c != -100, ce_t_c, torch.zeros_like(ce_t_c))
+                    else:
+                        ce_t_c = F.cross_entropy(
+                            t_c.float().reshape(-1, V), y_c.reshape(-1),
+                            reduction="none", ignore_index=-100,
+                        ).view_as(y_c)
+                    kl_det_c, ce_s_det_c = self._chunk_topk_kl_ce(
+                        s_c, top_idx, logp_t_top, p_t_top, p_t_tail, y_c, T
+                    )
+                    ce_t_chunks.append(ce_t_c)
+                    ce_s_det_chunks.append(ce_s_det_c)
+                    kl_det_chunks.append(kl_det_c)
+
+        rho_w = None
+        if use_rho and shift_y is not None:
+            valid = (shift_y != -100)
+            if S <= 1:
+                rho_w = valid.float()
+            else:
+                with torch.no_grad():
+                    ce_s_det = torch.cat(ce_s_det_chunks, dim=1)
+                    ce_t_det = torch.cat(ce_t_chunks, dim=1)
+                    kl_nats = torch.cat(kl_det_chunks, dim=1) / max(T * T, 1.0)
+                    score = (ce_s_det - ce_t_det) + kl_nats
+                    # Exclude padded positions (labels == -100) before quantile / topk selection.
+                    flat_t = ce_t_det[valid]
+                    if flat_t.numel() >= 16:
+                        q90 = torch.quantile(flat_t, 0.90)
+                        score = torch.where(ce_t_det > q90, torch.full_like(score, -1e9), score)
+                    score = torch.where(valid, score, torch.full_like(score, -1e9))
+                    rho_w = torch.where(valid, torch.full_like(score, float(rho_min_w)), torch.zeros_like(score))
+                    for b in range(B):
+                        n_val = int(valid[b].sum().item())
+                        if n_val <= 0:
+                            continue
+                        k_keep = max(1, min(n_val, int(round(n_val * float(rho_keep)))))
+                        _, top_pos = torch.topk(score[b], k=k_keep, dim=-1)
+                        rho_w[b].scatter_(-1, top_pos, 1.0)
+                    rho_w = rho_w * valid.float()
+
+        # Drop references to teacher chunks before running grad-tracked student chunks.
+        del t_v, ce_t_chunks, ce_s_det_chunks, kl_det_chunks
+
+        kl_outs, ce_outs = [], []
+        use_ckpt = bool(s_v.requires_grad and torch.is_grad_enabled())
+        need_ce = shift_y is not None
+        for idx_c, st in enumerate(range(0, S, chunk)):
+            ed = min(S, st + chunk)
+            s_c = s_v[:, st:ed, :]
+            y_c = shift_y[:, st:ed] if need_ce else None
+            ti_c = top_idxs[idx_c]
+            lpt_c = logp_t_tops[idx_c]
+            pt_c = p_t_tops[idx_c]
+            ptail_c = p_t_tails[idx_c]
+            if use_ckpt:
+                if need_ce:
+                    kl_c, ce_c = _ckpt(
+                        lambda _s, _ti, _lpt, _pt, _ptail, _y: self._chunk_topk_kl_ce(
+                            _s, _ti, _lpt, _pt, _ptail, _y, T
+                        ),
+                        s_c, ti_c, lpt_c, pt_c, ptail_c, y_c,
+                        use_reentrant=False,
+                    )
+                    ce_outs.append(ce_c)
+                else:
+                    kl_c = _ckpt(
+                        lambda _s, _ti, _lpt, _pt, _ptail: self._chunk_topk_kl_ce(
+                            _s, _ti, _lpt, _pt, _ptail, None, T
+                        )[0],
+                        s_c, ti_c, lpt_c, pt_c, ptail_c,
+                        use_reentrant=False,
+                    )
+            else:
+                kl_c, ce_c = self._chunk_topk_kl_ce(s_c, ti_c, lpt_c, pt_c, ptail_c, y_c, T)
+                if need_ce:
+                    ce_outs.append(ce_c)
+            kl_outs.append(kl_c)
+
+        per_pos_kl = kl_outs[0] if len(kl_outs) == 1 else torch.cat(kl_outs, dim=1)
+        ce_per_pos = (ce_outs[0] if len(ce_outs) == 1 else torch.cat(ce_outs, dim=1)) if need_ce else None
+        return per_pos_kl, ce_per_pos, rho_w
+
     def _per_pos_kl(self, shift_s, shift_t, T, chunk=256, topk: int = 0):
         """Per-position KL(t||s) in fp32, chunked over the sequence.
 
@@ -202,12 +365,19 @@ class LrcDistillLoss(_BaseLoss):
         if S <= 1:
             return torch.ones_like(per_pos_kl)
         with torch.no_grad():
-            ce_s_det = F.cross_entropy(
-                shift_s.detach().float().view(-1, V), shift_y.view(-1), reduction="none"
-            ).view(B, S)
-            ce_t_det = F.cross_entropy(
-                shift_t.detach().float().view(-1, int(shift_t.size(-1))), shift_y.view(-1), reduction="none"
-            ).view(B, S)
+            ce_s_chunks, ce_t_chunks = [], []
+            V_t = int(shift_t.size(-1))
+            for st in range(0, S, 256):
+                ed = min(S, st + 256)
+                yc = shift_y[:, st:ed].reshape(-1)
+                ce_s_chunks.append(F.cross_entropy(
+                    shift_s[:, st:ed, :].detach().float().reshape(-1, V), yc, reduction="none"
+                ).view(B, ed - st))
+                ce_t_chunks.append(F.cross_entropy(
+                    shift_t[:, st:ed, :].detach().float().reshape(-1, V_t), yc, reduction="none"
+                ).view(B, ed - st))
+            ce_s_det = torch.cat(ce_s_chunks, dim=1)
+            ce_t_det = torch.cat(ce_t_chunks, dim=1)
             kl_nats = per_pos_kl.detach().float() / max(T * T, 1.0)
             score = (ce_s_det - ce_t_det) + kl_nats
             # Filter out high-entropy teacher noise tokens (top 10% highest teacher CE)
@@ -295,7 +465,7 @@ class LrcDistillLoss(_BaseLoss):
                 t_hidden = None  # filled by the aux block via a short second forward
             except Exception:
                 t_logits = None
-        shift_s = logits[..., :-1, :].contiguous()
+        shift_s = logits[..., :-1, :]
         if shift_s.size(1) == 0:
             return logits.sum() * 0.0
         loss = 0.0
@@ -304,43 +474,75 @@ class LrcDistillLoss(_BaseLoss):
         if twcfg is not None:
             stage = str(getattr(twcfg, "stage", stage)).lower()
         is_sft = (stage == "sft")
-        shift_y = None
-        shift_t = None
+        shift_y = labels[..., 1:] if labels is not None else None
         per_pos = None
-        if t_logits is not None:
+        rho_w = None
+        V_s = int(shift_s.size(-1))
+        V_t = int(t_logits.size(-1)) if t_logits is not None else 0
+        use_fused_topk = (
+            t_logits is not None
+            and 0 < int(kl_topk or 0) < min(V_s, V_t)
+        )
+        if use_fused_topk:
             _tk = _tick() if _p else 0.0
-            shift_t = t_logits[..., :-1, :].contiguous().detach()
-            per_pos = self._per_pos_kl(shift_s, shift_t, T, topk=kl_topk)  # [B,S-1]
+            use_rho = (not is_sft) and (0.0 < rho_keep < 1.0) and (shift_y is not None)
+            shift_t = t_logits[..., :-1, :].detach()
+            t_logits = None  # release outer reference early
+            per_pos, ce_per_pos, rho_w = self._fused_topk_distill(
+                shift_s, shift_t, shift_y, T, int(kl_topk),
+                use_rho=use_rho, rho_keep=rho_keep, rho_min_w=rho_min_w,
+            )
+            del shift_t
             if _p:
                 _PROF["t_kl"] += _tock(_tk)
-        use_rho = (not is_sft) and (0.0 < rho_keep < 1.0) and (per_pos is not None)
-        rho_w = None
-        if labels is not None:
-            shift_y = labels[..., 1:].contiguous()
-            _tc = _tick() if _p else 0.0
-            if is_sft:
-                ntp = F.cross_entropy(shift_s.view(-1, shift_s.size(-1)),
-                                      shift_y.view(-1), ignore_index=-100)
-            elif use_rho:
-                rho_w = self._rho_token_weights(shift_s, shift_t, shift_y, per_pos, T,
-                                                rho_keep, rho_min_w)
-                ce_per_pos = F.cross_entropy(
-                    shift_s.view(-1, shift_s.size(-1)), shift_y.view(-1), reduction="none"
-                ).view_as(rho_w)
-                ntp = (ce_per_pos * rho_w).sum() / rho_w.sum().clamp_min(1.0)
-            else:  # pt: labels==input_ids, dense supervision
-                ntp = F.cross_entropy(shift_s.view(-1, shift_s.size(-1)),
-                                      shift_y.view(-1))
-            if _p:
-                _PROF["t_ce"] += _tock(_tc)
-            loss = loss + wNTP * ntp
+            if shift_y is not None and ce_per_pos is not None:
+                valid = (shift_y != -100).to(ce_per_pos.dtype)
+                if is_sft:
+                    ntp = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1.0)
+                elif rho_w is not None:
+                    w_eff = rho_w * valid
+                    ntp = (ce_per_pos * w_eff).sum() / w_eff.sum().clamp_min(1.0)
+                else:
+                    ntp = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1.0)
+                loss = loss + wNTP * ntp
+        else:
+            shift_t = None
+            if t_logits is not None:
+                _tk = _tick() if _p else 0.0
+                shift_t = t_logits[..., :-1, :].detach()
+                per_pos = self._per_pos_kl(shift_s, shift_t, T, topk=kl_topk)  # [B,S-1]
+                if _p:
+                    _PROF["t_kl"] += _tock(_tk)
+            use_rho = (not is_sft) and (0.0 < rho_keep < 1.0) and (per_pos is not None)
+            if shift_y is not None:
+                _tc = _tick() if _p else 0.0
+                if is_sft:
+                    ntp = F.cross_entropy(shift_s.reshape(-1, V_s),
+                                          shift_y.reshape(-1), ignore_index=-100)
+                elif use_rho:
+                    rho_w = self._rho_token_weights(shift_s, shift_t, shift_y, per_pos, T,
+                                                    rho_keep, rho_min_w)
+                    ce_per_pos = F.cross_entropy(
+                        shift_s.reshape(-1, V_s), shift_y.reshape(-1), reduction="none"
+                    ).view_as(rho_w)
+                    ntp = (ce_per_pos * rho_w).sum() / rho_w.sum().clamp_min(1.0)
+                else:  # pt: labels==input_ids, dense supervision
+                    ntp = F.cross_entropy(shift_s.reshape(-1, V_s),
+                                          shift_y.reshape(-1))
+                if _p:
+                    _PROF["t_ce"] += _tock(_tc)
+                loss = loss + wNTP * ntp
         kl = None
         if per_pos is not None:
             if is_sft and shift_y is not None:
                 kl = self._masked_mean(per_pos, shift_y, loss_scale)
             elif rho_w is not None:
-                kl = (per_pos * rho_w).sum() / rho_w.sum().clamp_min(1.0)
-            else:  # pt: every position distills
+                w_eff = rho_w * ((shift_y != -100).to(rho_w.dtype) if shift_y is not None else 1.0)
+                kl = (per_pos * w_eff).sum() / w_eff.sum().clamp_min(1.0)
+            elif shift_y is not None:
+                valid = (shift_y != -100).to(per_pos.dtype)
+                kl = (per_pos * valid).sum() / valid.sum().clamp_min(1.0)
+            else:  # pt without labels: every position distills
                 kl = per_pos.mean()
             loss = loss + wKL * kl
         aux = None

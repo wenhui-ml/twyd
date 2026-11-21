@@ -29,11 +29,12 @@ EVAL_TAG=${EVAL_TAG:-paper_PTmoe_v2}
 
 LR=${LR:-1e-4}
 CLIP=${CLIP:-50.0}
-DS=${DS:-zero2}
+DS=${DS:-$ROOT/configs/ds_zero2_offload_torch.json}
 SEQ=${SEQ:-2048}
-BS=${BS:-1}
-GAS=${GAS:-32}
+BS=${BS:-2}
+GAS=${GAS:-16}
 NPROC=${NPROC:-2}
+OMP_THREADS=${OMP_THREADS:-8}
 
 if [ ! -f "$CORPUS" ]; then
   echo "[twyd-moe-v2] ERROR: missing corpus $CORPUS" >&2
@@ -51,7 +52,8 @@ echo "[twyd-moe-v2] start $(date '+%F %H:%M') steps=$STEPS save_steps=$SAVE_STEP
 echo "[twyd-moe-v2] init=$PT_INIT corpus=$CORPUS out=$OUT"
 rm -rf "$OUT"
 
-env PYTORCH_HIP_ALLOC_CONF=expandable_segments:True PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+env OMP_NUM_THREADS="$OMP_THREADS" \
+  PYTORCH_HIP_ALLOC_CONF=expandable_segments:True PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   CUDA_VISIBLE_DEVICES=${GPU:-0,1} NPROC="$NPROC" DS="$DS" \
   BRANCH=moe STAGE=pt WARM_START=pt_ckpt PT_CKPT="$PT_INIT" \
   MODEL=/home/chenwh/models/LRC-1.5B-Base MODEL_TYPE=llama TEMPLATE=llama3_2 \

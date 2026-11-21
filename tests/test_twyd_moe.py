@@ -129,3 +129,40 @@ def test_moe_save_and_hf_trust_remote_code_reload(tmp_path, monkeypatch):
         z_resumed = resumed.student(input_ids=ids).logits
     assert torch.allclose(z_before, z_resumed, atol=1e-5), f"max diff={(z_before - z_resumed).abs().max().item()}"
     assert resumed.student.model.layers[1].mlp.w_down.abs().sum() > 0
+
+
+def test_fused_topk_loss_parity_and_pad_mask():
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    B, S, V = 2, 32, 128
+    sa = torch.randn(B, S, V, requires_grad=True)
+    sb = sa.detach().clone().requires_grad_(True)
+    tt = torch.randn(B, S, V)
+    yy = torch.randint(0, V, (B, S))
+
+    loss_obj = LrcDistillLoss(SimpleNamespace(), SimpleNamespace(model=None))
+    # 1. Exact parity without padding
+    per_pos_ref = loss_obj._per_pos_kl(sa[:, :-1, :], tt[:, :-1, :], 1.0, topk=16)
+    rw_ref = loss_obj._rho_token_weights(sa[:, :-1, :], tt[:, :-1, :], yy[:, 1:], per_pos_ref, 1.0, 0.35, 0.1)
+    ce_ref = F.cross_entropy(sa[:, :-1, :].reshape(-1, V), yy[:, 1:].reshape(-1), reduction="none").view_as(rw_ref)
+    L_ref = (ce_ref * rw_ref).sum() / rw_ref.sum() + 5.0 * (per_pos_ref * rw_ref).sum() / rw_ref.sum()
+    L_ref.backward()
+
+    per_pos_f, ce_f, rw_f = loss_obj._fused_topk_distill(sb[:, :-1, :], tt[:, :-1, :], yy[:, 1:], 1.0, 16, True, 0.35, 0.1)
+    L_f = (ce_f * rw_f).sum() / rw_f.sum() + 5.0 * (per_pos_f * rw_f).sum() / rw_f.sum()
+    L_f.backward()
+    assert abs(L_ref.item() - L_f.item()) < 1e-4
+    assert torch.allclose(sa.grad, sb.grad, atol=1e-4)
+
+    # 2. BS=2 with -100 padding in row 1 must yield exact zero grad on padded positions
+    sc = sa.detach().clone().requires_grad_(True)
+    yp = yy.clone()
+    yp[1, 12:] = -100
+    per_pos_p, ce_p, rw_p = loss_obj._fused_topk_distill(sc[:, :-1, :], tt[:, :-1, :], yp[:, 1:], 1.0, 16, True, 0.35, 0.1)
+    valid = (yp[:, 1:] != -100).float()
+    w_eff = rw_p * valid
+    L_p = (ce_p * w_eff).sum() / w_eff.sum() + 5.0 * (per_pos_p * w_eff).sum() / w_eff.sum()
+    L_p.backward()
+    assert sc.grad[1, 11:-1].abs().max().item() == 0.0, "padded positions leaked gradient!"
+    assert sc.grad[0, :10].abs().sum().item() > 0.0
