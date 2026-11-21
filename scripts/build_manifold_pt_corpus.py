@@ -76,7 +76,15 @@ def _extract_signature(text: str, df: Counter, n_docs: int) -> tuple[str, str]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--knowledge", default="data/pt_knowledge.jsonl")
+    ap.add_argument("--extra-knowledge", default="",
+                    help="optional second knowledge JSONL to merge before clustering")
+    ap.add_argument("--extra-max-mb", type=float, default=300.0,
+                    help="max MB to read from --extra-knowledge")
+    ap.add_argument("--know-skip-mb", type=float, default=0.0,
+                    help="skip initial MB of --knowledge to construct non-overlapping v2 shards")
     ap.add_argument("--web", default="data/fw_score4_1B.jsonl")
+    ap.add_argument("--web-skip-mb", type=float, default=0.0,
+                    help="skip initial MB of --web to construct non-overlapping v2 shards")
     ap.add_argument("--out", default="data/pt_manifold_200M.jsonl")
     ap.add_argument("--target-mb", type=float, default=800.0,
                     help="total output size in MB (~4 MB per 1M tokens -> 800 MB ~= 200M tokens)")
@@ -95,13 +103,19 @@ def main() -> None:
     know_budget = int(target_bytes * args.know_ratio)
     web_budget = target_bytes - know_budget
 
-    print(f"[manifold] reading knowledge pool from {args.knowledge} ...", flush=True)
+    print(f"[manifold] reading knowledge pool from {args.knowledge} (skip={args.know_skip_mb:.0f} MB) ...", flush=True)
     know_docs: list[str] = []
     df: Counter = Counter()
     max_read_bytes = int(know_budget * 1.6)
+    skip_know_bytes = int(args.know_skip_mb * 1e6)
+    skipped_b = 0
     read_b = 0
     with open(args.knowledge, "r", encoding="utf-8") as f:
         for line in f:
+            lb = len(line)
+            if skipped_b < skip_know_bytes:
+                skipped_b += lb
+                continue
             try:
                 t = (json.loads(line).get("text") or "").strip()
             except Exception:
@@ -112,9 +126,33 @@ def main() -> None:
             seen = set(_WORD_RE.findall(t[:1500].lower())) - _STOP
             for w in seen:
                 df[w] += 1
-            read_b += len(line)
+            read_b += lb
             if read_b >= max_read_bytes and len(know_docs) >= 20000:
                 break
+
+    if args.extra_knowledge and os.path.isfile(args.extra_knowledge) and args.extra_max_mb > 0:
+        extra_cap = int(args.extra_max_mb * 1e6)
+        extra_b = 0
+        with open(args.extra_knowledge, "r", encoding="utf-8") as ef:
+            for line in ef:
+                try:
+                    t = (json.loads(line).get("text") or "").strip()
+                except Exception:
+                    continue
+                if len(t) < 300:
+                    continue
+                know_docs.append(t)
+                seen = set(_WORD_RE.findall(t[:1500].lower())) - _STOP
+                for w in seen:
+                    df[w] += 1
+                lb = len(line)
+                extra_b += lb
+                read_b += lb
+                if extra_b >= extra_cap:
+                    break
+        print(f"[manifold] merged extra knowledge from {args.extra_knowledge} ({extra_b/1e6:.1f} MB)", flush=True)
+
+    rng.shuffle(know_docs)
 
     print(f"[manifold] loaded {len(know_docs)} knowledge docs ({read_b/1e6:.1f} MB) in {time.time()-t0:.1f}s",
           flush=True)
@@ -181,6 +219,13 @@ def main() -> None:
     n_out = 0
     with open(args.web, "r", encoding="utf-8") as wsrc, \
             open(args.out, "w", encoding="utf-8") as out:
+        skip_web_bytes = int(args.web_skip_mb * 1e6)
+        skipped_web = 0
+        while skipped_web < skip_web_bytes:
+            wline = wsrc.readline()
+            if not wline:
+                break
+            skipped_web += len(wline.encode("utf-8"))
         while (know_written > 0 and ki < len(packed_windows)) or web_written < web_budget:
             # Write 1-2 neighbor-packed knowledge windows
             for _ in range(2):
