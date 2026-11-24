@@ -25,6 +25,11 @@ def main() -> None:
     ap.add_argument("--openstax-mb", type=float, default=220.0)
     ap.add_argument("--stanford-mb", type=float, default=130.0)
     ap.add_argument("--math-mb", type=float, default=100.0)
+    ap.add_argument("--khan-mb", type=float, default=0.0)
+    ap.add_argument("--webv2-mb", type=float, default=0.0)
+    ap.add_argument("--skip-openstax-mb", type=float, default=0.0)
+    ap.add_argument("--skip-stanford-mb", type=float, default=0.0)
+    ap.add_argument("--skip-math-mb", type=float, default=0.0)
     ap.add_argument("--extra-mb", type=float, default=150.0)
     ap.add_argument("--min-chars", type=int, default=500)
     ap.add_argument("--max-chars", type=int, default=12000)
@@ -37,15 +42,21 @@ def main() -> None:
     b_total = 0
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fout:
-        for cfg, mb in (
-            ("openstax", args.openstax_mb),
-            ("stanford", args.stanford_mb),
-            ("auto_math_text", args.math_mb),
+        for cfg, mb, skip_mb in (
+            ("openstax", args.openstax_mb, args.skip_openstax_mb),
+            ("stanford", args.stanford_mb, args.skip_stanford_mb),
+            ("khanacademy", args.khan_mb, 0.0),
+            ("auto_math_text", args.math_mb, args.skip_math_mb),
+            ("web_samples_v2", args.webv2_mb, 0.0),
         ):
+            if mb <= 0:
+                continue
             budget = int(mb * 1e6)
+            skip_budget = int(skip_mb * 1e6)
+            skipped = 0
             got = 0
             cnt = 0
-            print(f"[textbook] streaming cosmopedia/{cfg} target {mb:.0f} MB ...", flush=True)
+            print(f"[textbook] streaming cosmopedia/{cfg} skip={skip_mb:.0f} MB target={mb:.0f} MB ...", flush=True)
             ds = load_dataset("HuggingFaceTB/cosmopedia", name=cfg, split="train", streaming=True)
             for row in ds:
                 txt = (row.get("text") or "").strip()
@@ -54,8 +65,11 @@ def main() -> None:
                 if len(txt) > args.max_chars:
                     txt = txt[: args.max_chars]
                 line = json.dumps({"text": txt}, ensure_ascii=False) + "\n"
-                fout.write(line)
                 lb = len(line.encode("utf-8"))
+                if skipped < skip_budget:
+                    skipped += lb
+                    continue
+                fout.write(line)
                 got += lb
                 b_total += lb
                 cnt += 1
@@ -65,7 +79,7 @@ def main() -> None:
                           flush=True)
                 if got >= budget:
                     break
-            print(f"[textbook] {cfg} done: {cnt} docs  {got/1e6:.1f} MB", flush=True)
+            print(f"[textbook] {cfg} done: {cnt} docs  {got/1e6:.1f} MB (skipped {skipped/1e6:.1f} MB)", flush=True)
 
         if args.extra_knowledge and os.path.isfile(args.extra_knowledge) and args.extra_mb > 0:
             ebudget = int(args.extra_mb * 1e6)
