@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         default="lrc_cluster",
         choices=["freq", "energy", "gram_greedy", "lrc_cluster"],
     )
-    p.add_argument("--router-mode", default="kl_fit", choices=["slice", "kl_fit"])
+    p.add_argument("--router-mode", default="slice", choices=["slice", "kl_fit"])
     p.add_argument("--lrc-ridge", dest="use_lrc_ridge", action="store_true", default=True)
     p.add_argument("--no-lrc-ridge", dest="use_lrc_ridge", action="store_false")
     p.add_argument("--lrc-rank", type=int, default=0, help="0=full damped ridge; >0=low-rank SVD delta")
@@ -143,6 +143,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--calib-bs", type=int, default=2)
     p.add_argument("--probe-tokens", type=int, default=512)
     p.add_argument("--ridge-sweeps", type=int, default=3)
+    p.add_argument("--ridge-alphas", type=str, default="0.2,1.0,5.0,20.0,80.0,250.0")
     p.add_argument("--router-steps", type=int, default=120)
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -158,7 +159,10 @@ def main() -> None:
 
     print(f"[compress_moe_lrc] loading {args.model} ({args.dtype} -> {device}) ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(device)
+    load_kw = {"dtype": dtype}
+    if getattr(torch.version, "hip", None):
+        load_kw["experts_implementation"] = "eager"
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kw).to(device)
     model.eval()
 
     calib_batches = load_calib_batches(
@@ -183,6 +187,7 @@ def main() -> None:
             flush=True,
         )
 
+    alphas = tuple(float(x.strip()) for x in args.ridge_alphas.split(",") if x.strip())
     cfg = MoeCompressConfig(
         target_experts=args.target_experts,
         target_top_k=args.target_top_k,
@@ -193,6 +198,7 @@ def main() -> None:
         sequential=args.sequential,
         probe_tokens=args.probe_tokens,
         ridge_sweeps=args.ridge_sweeps,
+        ridge_alphas=alphas,
         router_steps=args.router_steps,
     )
 

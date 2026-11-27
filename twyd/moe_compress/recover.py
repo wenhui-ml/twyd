@@ -31,7 +31,8 @@ class RecoveryConfig:
     kl_topk: int = 256
     kl_weight: float = 2.0
     ce_weight: float = 1.0
-    router_kl_weight: float = 0.5
+    router_kl_weight: float = 0.2
+    router_target_mode: str = "survivor"  # "survivor" (conditional over kept experts) | "cluster"
     aux_loss_weight: float = 0.01
     chunk_size: int = 512
     lr: float = 5e-5
@@ -42,15 +43,19 @@ class RecoveryConfig:
     cpu_offload_optimizer: bool = True
 
 
-def load_cluster_maps(cluster_map_path: str) -> Tuple[int, Dict[int, torch.Tensor]]:
-    """Load `lrc_cluster_map.json` -> `(new_num_experts, {layer_idx: LongTensor[E]})`."""
+def load_cluster_maps(
+    cluster_map_path: str,
+) -> Tuple[int, Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+    """Load `lrc_cluster_map.json` -> `(new_E, {layer: cluster_map[E]}, {layer: survivors[K']})`."""
     with open(cluster_map_path, "r") as f:
         obj = json.load(f)
     new_e = int(obj["new_experts"])
-    out: Dict[int, torch.Tensor] = {}
+    cmaps: Dict[int, torch.Tensor] = {}
+    survs: Dict[int, torch.Tensor] = {}
     for k, v in obj["layers"].items():
-        out[int(k)] = torch.tensor(v["cluster_map"], dtype=torch.long)
-    return new_e, out
+        cmaps[int(k)] = torch.tensor(v["cluster_map"], dtype=torch.long)
+        survs[int(k)] = torch.tensor(v["survivors"], dtype=torch.long)
+    return new_e, cmaps, survs
 
 
 @torch.no_grad()
@@ -99,18 +104,30 @@ def aggregate_teacher_router_targets(
     teacher_router_logits: Sequence[torch.Tensor],
     cluster_maps: Dict[int, torch.Tensor],
     new_num_experts: int,
+    survivors: Optional[Dict[int, torch.Tensor]] = None,
+    mode: str = "survivor",
 ) -> List[torch.Tensor]:
-    """Convert teacher per-layer router logits `[N, E]` into cluster prob targets `[N, K']`."""
+    """Convert teacher per-layer router logits `[N, E]` into student prob targets `[N, K']`.
+
+    - `mode="survivor"`: conditional softmax over the `K'` kept experts
+      `softmax(z_t[:, survivors])`, preserving exact specialization without
+      cluster-mass distortion under `norm_topk_prob=False`.
+    - `mode="cluster"`: probability-mass-preserving cluster sum `sum_{e in C_j} p_t[e]`.
+    """
     targets: List[torch.Tensor] = []
     for layer_idx, r_logits in enumerate(teacher_router_logits):
         if layer_idx not in cluster_maps:
             continue
-        p_t = F.softmax(r_logits.float(), dim=-1)
-        cmap = cluster_maps[layer_idx].to(device=p_t.device)
-        p_c = torch.zeros((p_t.shape[0], new_num_experts), dtype=torch.float32, device=p_t.device)
-        p_c.index_add_(1, cmap, p_t)
-        p_c = p_c.clamp_min(1e-12)
-        p_c = p_c / p_c.sum(dim=-1, keepdim=True)
+        if mode == "survivor" and survivors is not None and layer_idx in survivors:
+            s_idx = survivors[layer_idx].to(device=r_logits.device)
+            p_c = F.softmax(r_logits.index_select(1, s_idx).float(), dim=-1)
+        else:
+            p_t = F.softmax(r_logits.float(), dim=-1)
+            cmap = cluster_maps[layer_idx].to(device=p_t.device)
+            p_c = torch.zeros((p_t.shape[0], new_num_experts), dtype=torch.float32, device=p_t.device)
+            p_c.index_add_(1, cmap, p_t)
+            p_c = p_c.clamp_min(1e-12)
+            p_c = p_c / p_c.sum(dim=-1, keepdim=True)
         targets.append(p_c.to(torch.bfloat16))
     return targets
 

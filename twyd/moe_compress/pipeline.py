@@ -27,7 +27,7 @@ class MoeCompressConfig:
     target_experts: int
     target_top_k: Optional[int] = None   # None -> keep original (clamped to target_experts)
     selection_method: str = "lrc_cluster"  # freq | energy | gram_greedy | lrc_cluster
-    router_mode: str = "kl_fit"            # slice | kl_fit
+    router_mode: str = "slice"             # slice (preserves expert specialization) | kl_fit
     use_lrc_ridge: bool = True
     lrc_rank: int = 0                      # 0 = full-rank damped ridge; >0 = low-rank SVD delta
     sequential: bool = True                # sequential input-compensated calibration
@@ -39,7 +39,7 @@ class MoeCompressConfig:
     router_l2_reg: float = 1e-4
     ridge_sweeps: int = 3
     ridge_step: float = 0.85
-    ridge_alphas: Tuple[float, ...] = (0.01, 0.1, 0.5, 2.0, 10.0)
+    ridge_alphas: Tuple[float, ...] = (0.05, 0.2, 1.0, 5.0, 20.0)
     gram_weight: float = 0.25
 
 

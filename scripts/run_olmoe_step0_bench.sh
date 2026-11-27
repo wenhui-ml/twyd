@@ -27,7 +27,7 @@ eval_model() {
     return 0
   fi
   echo "[bench] eval $tag ($ckpt) ..."
-  HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PRESET=paper GPU="$GPU_ID" BATCH="$BATCH" \
+  HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 EXPERTS_IMPL=eager PRESET=paper GPU="$GPU_ID" BATCH="$BATCH" \
     bash "$ROOT/scripts/run_lm_eval.sh" "$ckpt" "paper_${tag}" \
     > "$ROOT/output/ev_${tag}.log" 2>&1
   echo "[bench] eval $tag done (rc=$?)"

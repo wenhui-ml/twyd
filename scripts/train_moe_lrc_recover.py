@@ -85,7 +85,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--router-lr-scale", type=float, default=2.0)
     p.add_argument("--kl-weight", type=float, default=2.0)
     p.add_argument("--ce-weight", type=float, default=1.0)
-    p.add_argument("--router-kl-weight", type=float, default=0.5)
+    p.add_argument("--router-kl-weight", type=float, default=0.2)
+    p.add_argument("--router-target-mode", default="survivor", choices=["survivor", "cluster"])
     p.add_argument("--aux-loss-weight", type=float, default=0.01)
     p.add_argument("--kl-topk", type=int, default=256)
     p.add_argument("--kl-temp", type=float, default=1.0)
@@ -110,18 +111,21 @@ def main() -> None:
     s_dev = torch.device(args.student_device)
     cmap_path = args.cluster_map or os.path.join(args.student, "lrc_cluster_map.json")
 
-    new_e, cluster_maps = load_cluster_maps(cmap_path)
-    print(f"[recover] loaded cluster_map ({len(cluster_maps)} layers, K'={new_e})", flush=True)
+    new_e, cluster_maps, survivor_maps = load_cluster_maps(cmap_path)
+    print(f"[recover] loaded cluster_map ({len(cluster_maps)} layers, K'={new_e}, mode={args.router_target_mode})", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.student)
+    load_kw = {"dtype": torch.bfloat16}
+    if getattr(torch.version, "hip", None):
+        load_kw["experts_implementation"] = "eager"
     print(f"[recover] loading teacher -> {t_dev} ...", flush=True)
-    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, dtype=torch.bfloat16).to(t_dev)
+    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, **load_kw).to(t_dev)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
 
     print(f"[recover] loading student -> {s_dev} ...", flush=True)
-    student = AutoModelForCausalLM.from_pretrained(args.student, dtype=torch.bfloat16).to(s_dev)
+    student = AutoModelForCausalLM.from_pretrained(args.student, **load_kw).to(s_dev)
     student.config.use_cache = False
     if args.grad_ckpt:
         student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -132,6 +136,7 @@ def main() -> None:
         kl_weight=args.kl_weight,
         ce_weight=args.ce_weight,
         router_kl_weight=args.router_kl_weight,
+        router_target_mode=args.router_target_mode,
         aux_loss_weight=args.aux_loss_weight,
         lr=args.lr,
         router_lr_scale=args.router_lr_scale,
@@ -183,7 +188,13 @@ def main() -> None:
                     t_out.logits, top_k=cfg.kl_topk, T=cfg.kl_temperature, chunk_size=cfg.chunk_size
                 )
                 t_router_targets = (
-                    aggregate_teacher_router_targets(t_out.router_logits, cluster_maps, new_e)
+                    aggregate_teacher_router_targets(
+                        t_out.router_logits,
+                        cluster_maps,
+                        new_e,
+                        survivors=survivor_maps,
+                        mode=cfg.router_target_mode,
+                    )
                     if (cfg.router_kl_weight > 0 and t_out.router_logits is not None)
                     else []
                 )

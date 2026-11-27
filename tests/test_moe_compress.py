@@ -283,8 +283,8 @@ def test_stage2_recovery_logit_kl_router_kl_and_cpu_offloaded_adamw(tmp_path):
         verbose=False,
     )
 
-    new_e, cmaps = load_cluster_maps(os.path.join(out_dir, "lrc_cluster_map.json"))
-    assert new_e == 4 and len(cmaps) == 2
+    new_e, cmaps, survs = load_cluster_maps(os.path.join(out_dir, "lrc_cluster_map.json"))
+    assert new_e == 4 and len(cmaps) == 2 and len(survs) == 2
 
     cfg = RecoveryConfig(lr=1e-3, kl_topk=32, chunk_size=16, trainable_scope="moe")
     groups = select_trainable_params(student, cfg)
@@ -297,7 +297,7 @@ def test_stage2_recovery_logit_kl_router_kl_and_cpu_offloaded_adamw(tmp_path):
     with torch.no_grad():
         t_out = teacher(input_ids=batch, use_cache=False, output_router_logits=True)
         top_idx, logp_t, p_t, p_tail = extract_teacher_topk_targets(t_out.logits, top_k=32, T=1.0, chunk_size=16)
-        r_targets = aggregate_teacher_router_targets(t_out.router_logits, cmaps, new_e)
+        r_targets = aggregate_teacher_router_targets(t_out.router_logits, cmaps, new_e, survivors=survs, mode="survivor")
 
     losses = []
     student.train()

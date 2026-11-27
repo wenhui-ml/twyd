@@ -300,7 +300,9 @@ def solve_lrc_down_proj(
     init_fit_rel = float(((y_fit - y_fit_init) ** 2).sum().item()) / fit_denom
     init_val_rel = float(((y_val - y_val_init) ** 2).sum().item()) / val_denom
 
-    # Precompute weighted intermediate activations H_j and Gram A_j = H_j^T H_j once
+    # Precompute weighted intermediate activations H_j and Gram A_j = H_j^T H_j once,
+    # PLUS solve exact closed-form K'-dim per-expert optimal scalar rescale beta_j*
+    # (cures norm_topk_prob=False softmax inflation with zero overfitting risk).
     expert_h_fit: List[torch.Tensor] = []
     expert_tok_fit: List[torch.Tensor] = []
     expert_gram_fit: List[torch.Tensor] = []
@@ -334,12 +336,73 @@ def solve_lrc_down_proj(
         else:
             expert_h_val.append(torch.empty((0, d_ff), dtype=torch.float32, device=dev))
 
+    # --- Step 1: Exact K'-parameter closed-form per-expert scalar rescale beta* ---
+    down_base = down_d.to(torch.float32).clone()
+    y_fit_base = y_fit_init.clone()
     best_val_rel = init_val_rel
     best_fit_rel = init_fit_rel
     best_alpha = float("inf")
-    best_down = down_d.to(torch.float32)
+    best_down = down_base.clone()
     accepted = False
 
+    if K > 0 and n_fit > 0:
+        # Build exact K x K Gram M_{a,b} = <U_a, U_b>_F and c_a = <U_a, Y_fit>_F in chunks
+        M = torch.zeros((K, K), dtype=torch.float64, device=dev)
+        c_vec = torch.zeros(K, dtype=torch.float64, device=dev)
+        chunk_b = 512
+        for start in range(0, n_fit, chunk_b):
+            end = min(start + chunk_b, n_fit)
+            B = end - start
+            xb = x_fit[start:end]
+            twb = tw_fit[start:end]
+            tib = ti_fit[start:end]
+            yb_t = y_fit[start:end]
+            u_slots = torch.zeros((B, top_k, H), dtype=torch.float32, device=dev)
+            for e_t in torch.unique(tib):
+                j = int(e_t.item())
+                tp, sp = torch.where(tib == j)
+                h = adapter.expert_hidden(xb[tp], gate_up_d[j], act_fn)
+                u_j = F.linear(h, down_d[j]).to(torch.float32) * twb[tp, sp].unsqueeze(-1).to(torch.float32)
+                u_slots[tp, sp] = u_j
+            # c_vec[j] += <u_slots, yb_t>
+            dots_y = (u_slots * yb_t.unsqueeze(1)).sum(dim=-1).to(torch.float64)
+            c_vec.scatter_add_(0, tib.reshape(-1), dots_y.reshape(-1))
+            # M[a, b] += <u_slots[:, a], u_slots[:, b]>
+            pair_u = torch.bmm(u_slots, u_slots.transpose(1, 2)).to(torch.float64)
+            ia = tib.unsqueeze(2).expand(B, top_k, top_k).reshape(-1)
+            ib = tib.unsqueeze(1).expand(B, top_k, top_k).reshape(-1)
+            M.view(-1).scatter_add_(0, ia * K + ib, pair_u.reshape(-1))
+
+        M = 0.5 * (M + M.T)
+        m_scale = max(float(torch.diagonal(M).mean().item()), 1e-6)
+        # Regularize toward 1.0 slightly for rare experts
+        lam_b = 1e-3 * m_scale
+        beta = torch.linalg.solve(
+            M + lam_b * torch.eye(K, dtype=torch.float64, device=dev),
+            c_vec + lam_b * torch.ones(K, dtype=torch.float64, device=dev),
+        ).to(torch.float32).clamp(0.1, 2.5)
+
+        down_scaled = down_base * beta.view(K, 1, 1)
+        y_fit_scaled = torch.zeros_like(y_fit)
+        y_val_scaled = torch.zeros_like(y_val)
+        for j in range(K):
+            if expert_tok_fit[j].numel() > 0:
+                y_fit_scaled.index_add_(0, expert_tok_fit[j], expert_h_fit[j] @ down_scaled[j].T)
+            if expert_tok_val[j].numel() > 0:
+                y_val_scaled.index_add_(0, expert_tok_val[j], expert_h_val[j] @ down_scaled[j].T)
+
+        s_fit_rel = float(((y_fit - y_fit_scaled) ** 2).sum().item()) / fit_denom
+        s_val_rel = float(((y_val - y_val_scaled) ** 2).sum().item()) / val_denom
+        if s_val_rel < best_val_rel:
+            down_base = down_scaled
+            y_fit_base = y_fit_scaled
+            best_val_rel = s_val_rel
+            best_fit_rel = s_fit_rel
+            best_down = down_scaled
+            best_alpha = 0.0  # indicates beta-rescale accepted
+            accepted = True
+
+    # --- Step 2: Coupled Gauss-Seidel LRC Ridge refinement around rescaled base ---
     for alpha in alphas:
         cand_down, cand_y_fit = _run_coupled_ridge_sweeps(
             expert_h_fit=expert_h_fit,
@@ -347,8 +410,8 @@ def solve_lrc_down_proj(
             expert_gram_fit=expert_gram_fit,
             expert_tr_scale=expert_tr_scale,
             y_fit_target=y_fit,
-            y_fit_init=y_fit_init,
-            down_init=down_d,
+            y_fit_init=y_fit_base,
+            down_init=down_base,
             alpha=float(alpha),
             n_sweeps=n_sweeps,
             damping_step=damping_step,

@@ -54,8 +54,11 @@ export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=$GPU        # ROCm reuses the CUDA_* vars
 export HIP_VISIBLE_DEVICES=$GPU
 
+MODEL_ARGS="pretrained=$CKPT,dtype=$DTYPE,trust_remote_code=True"
+[ -n "${EXPERTS_IMPL:-}" ] && MODEL_ARGS="${MODEL_ARGS},experts_implementation=${EXPERTS_IMPL}"
+
 args=(--model hf
-      --model_args "pretrained=$CKPT,dtype=$DTYPE,trust_remote_code=True"
+      --model_args "$MODEL_ARGS"
       --tasks "$TASKS"
       --num_fewshot 0
       --batch_size "$BATCH"
