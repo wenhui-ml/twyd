@@ -32,7 +32,9 @@ from twyd.moe_compress.recover import (
     compute_fused_logit_kl_ce,
     compute_router_kl_loss,
     extract_teacher_topk_targets,
+    inject_moe_expert_lora_,
     load_cluster_maps,
+    save_merged_native_moe,
     select_trainable_params,
 )
 
@@ -81,8 +83,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=30)
     p.add_argument("--save-steps", type=int, default=250)
     p.add_argument("--log-steps", type=int, default=5)
-    p.add_argument("--lr", type=float, default=5e-5)
-    p.add_argument("--router-lr-scale", type=float, default=2.0)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--router-lr-scale", type=float, default=0.5)
+    p.add_argument("--lora-rank", type=int, default=64, help=">0: mergeable per-expert LoRA rank; 0: full-rank")
+    p.add_argument("--lora-alpha", type=float, default=64.0)
     p.add_argument("--kl-weight", type=float, default=2.0)
     p.add_argument("--ce-weight", type=float, default=1.0)
     p.add_argument("--router-kl-weight", type=float, default=0.2)
@@ -91,7 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kl-topk", type=int, default=256)
     p.add_argument("--kl-temp", type=float, default=1.0)
     p.add_argument("--trainable-scope", default="moe", choices=["moe", "all"])
-    p.add_argument("--no-cpu-offload", dest="cpu_offload", action="store_false", default=True)
+    p.add_argument("--cpu-offload", dest="cpu_offload", action="store_true", default=False)
+    p.add_argument("--no-cpu-offload", dest="cpu_offload", action="store_false")
     p.add_argument("--grad-checkpoint", dest="grad_ckpt", action="store_true", default=True)
     p.add_argument("--no-grad-checkpoint", dest="grad_ckpt", action="store_false")
     return p.parse_args()
@@ -115,18 +120,21 @@ def main() -> None:
     print(f"[recover] loaded cluster_map ({len(cluster_maps)} layers, K'={new_e}, mode={args.router_target_mode})", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.student)
-    load_kw = {"dtype": torch.bfloat16}
+    load_kw = {"dtype": torch.bfloat16, "low_cpu_mem_usage": True}
     if getattr(torch.version, "hip", None):
         load_kw["experts_implementation"] = "eager"
     print(f"[recover] loading teacher -> {t_dev} ...", flush=True)
-    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, **load_kw).to(t_dev)
+    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, device_map={"": str(t_dev)}, **load_kw)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
 
     print(f"[recover] loading student -> {s_dev} ...", flush=True)
-    student = AutoModelForCausalLM.from_pretrained(args.student, **load_kw).to(s_dev)
+    student = AutoModelForCausalLM.from_pretrained(args.student, device_map={"": str(s_dev)}, **load_kw)
     student.config.use_cache = False
+    if args.lora_rank > 0:
+        n_wrapped = inject_moe_expert_lora_(student, rank=args.lora_rank, alpha=args.lora_alpha)
+        print(f"[recover] injected mergeable MoeExpertLoRA (r={args.lora_rank}, alpha={args.lora_alpha}) on {n_wrapped} layers", flush=True)
     if args.grad_ckpt:
         student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -140,6 +148,8 @@ def main() -> None:
         aux_loss_weight=args.aux_loss_weight,
         lr=args.lr,
         router_lr_scale=args.router_lr_scale,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         trainable_scope=args.trainable_scope,
         cpu_offload_optimizer=args.cpu_offload,
     )
@@ -270,10 +280,8 @@ def main() -> None:
 
         if step % args.save_steps == 0 or step == args.max_steps:
             ck_dir = os.path.join(args.out, f"checkpoint-{step}")
-            os.makedirs(ck_dir, exist_ok=True)
-            student.save_pretrained(ck_dir, safe_serialization=True)
-            tokenizer.save_pretrained(ck_dir)
-            print(f"[recover] saved native HF MoE checkpoint -> {ck_dir}", flush=True)
+            save_merged_native_moe(student, ck_dir, tokenizer=tokenizer)
+            print(f"[recover] saved merged 100% native HF MoE checkpoint -> {ck_dir}", flush=True)
 
     print(f"[recover] DONE in {(time.time()-t_start)/60:.1f} min -> {args.out}", flush=True)
 

@@ -35,12 +35,133 @@ class RecoveryConfig:
     router_target_mode: str = "survivor"  # "survivor" (conditional over kept experts) | "cluster"
     aux_loss_weight: float = 0.01
     chunk_size: int = 512
-    lr: float = 5e-5
-    router_lr_scale: float = 2.0
+    lr: float = 2e-4
+    router_lr_scale: float = 0.5
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
+    lora_rank: int = 64            # >0 = mergeable per-expert LoRA (0 = full-rank)
+    lora_alpha: float = 64.0
     trainable_scope: str = "moe"   # "moe" (experts+routers+norms) | "all"
-    cpu_offload_optimizer: bool = True
+    cpu_offload_optimizer: bool = False
+
+
+class MoeExpertLoRAWrapper(nn.Module):
+    """Mergeable per-expert low-rank adapter wrapping native fused 3D `OlmoeExperts`.
+
+    Forward adds `(A_gu @ B_gu)` to `gate_up_proj` and `(A_d @ B_d)` to `down_proj`
+    per active expert without ever materializing full 3D dense updates on GPU, and
+    folds 100% losslessly back into native `OlmoeExperts` tensors at export time.
+    """
+
+    def __init__(self, base_experts: nn.Module, rank: int = 64, alpha: float = 64.0):
+        super().__init__()
+        self.base_experts = base_experts
+        self.rank = int(rank)
+        self.scale = float(alpha) / max(self.rank, 1)
+
+        gu = base_experts.gate_up_proj  # [E, 2*d_ff, H]
+        dn = base_experts.down_proj     # [E, H, d_ff]
+        E, two_dff, H = gu.shape
+        d_ff = dn.shape[2]
+        dev, dt = gu.device, gu.dtype
+
+        # Freeze base 3D weights
+        base_experts.gate_up_proj.requires_grad_(False)
+        base_experts.down_proj.requires_grad_(False)
+
+        # gate_up delta: [E, 2*d_ff, H] = B_gu [E, 2*d_ff, r] @ A_gu [E, r, H]
+        # Zero-init B so Step 0 is bit-exact with base_experts.
+        self.gu_A = nn.Parameter(torch.empty((E, self.rank, H), device=dev, dtype=dt))
+        self.gu_B = nn.Parameter(torch.zeros((E, two_dff, self.rank), device=dev, dtype=dt))
+        self.dn_A = nn.Parameter(torch.empty((E, self.rank, d_ff), device=dev, dtype=dt))
+        self.dn_B = nn.Parameter(torch.zeros((E, H, self.rank), device=dev, dtype=dt))
+        nn.init.kaiming_uniform_(self.gu_A, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.dn_A, a=math.sqrt(5))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        base = self.base_experts
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=base.num_experts).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            e = int(expert_idx[0].item())
+            if e == base.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[e])
+            cur = hidden_states[token_idx]
+
+            # gate_up: base + scale * (cur @ A^T) @ B^T
+            gu_out = F.linear(cur, base.gate_up_proj[e]) + self.scale * F.linear(
+                F.linear(cur, self.gu_A[e]), self.gu_B[e]
+            )
+            gate, up = gu_out.chunk(2, dim=-1)
+            h = base.act_fn(gate) * up
+
+            # down: base + scale * (h @ A^T) @ B^T
+            dn_out = F.linear(h, base.down_proj[e]) + self.scale * F.linear(
+                F.linear(h, self.dn_A[e]), self.dn_B[e]
+            )
+            dn_out = dn_out * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, dn_out.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+    @torch.no_grad()
+    def merged_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return exact merged `(gate_up_proj, down_proj)` in base dtype."""
+        gu_delta = torch.bmm(self.gu_B.float(), self.gu_A.float()) * self.scale
+        dn_delta = torch.bmm(self.dn_B.float(), self.dn_A.float()) * self.scale
+        new_gu = (self.base_experts.gate_up_proj.float() + gu_delta).to(self.base_experts.gate_up_proj.dtype)
+        new_dn = (self.base_experts.down_proj.float() + dn_delta).to(self.base_experts.down_proj.dtype)
+        return new_gu, new_dn
+
+
+def inject_moe_expert_lora_(model: nn.Module, rank: int = 64, alpha: float = 64.0) -> int:
+    """Wrap every MoE layer's `mlp.experts` with `MoeExpertLoRAWrapper` in-place."""
+    if rank <= 0:
+        return 0
+    count = 0
+    for layer in model.model.layers:
+        if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+            if not isinstance(layer.mlp.experts, MoeExpertLoRAWrapper):
+                layer.mlp.experts = MoeExpertLoRAWrapper(layer.mlp.experts, rank=rank, alpha=alpha)
+                count += 1
+    return count
+
+
+@torch.no_grad()
+def save_merged_native_moe(model: nn.Module, save_dir: str, tokenizer=None) -> None:
+    """Save 100% native HF MoE checkpoint with all `MoeExpertLoRAWrapper` deltas merged in."""
+    os.makedirs(save_dir, exist_ok=True)
+    saved_wrappers: List[Tuple[nn.Module, MoeExpertLoRAWrapper, torch.Tensor, torch.Tensor]] = []
+    try:
+        for layer in model.model.layers:
+            if hasattr(layer, "mlp") and isinstance(layer.mlp.experts, MoeExpertLoRAWrapper):
+                wrap = layer.mlp.experts
+                base = wrap.base_experts
+                orig_gu = base.gate_up_proj.data.clone()
+                orig_dn = base.down_proj.data.clone()
+                merged_gu, merged_dn = wrap.merged_weights()
+                base.gate_up_proj.data.copy_(merged_gu)
+                base.down_proj.data.copy_(merged_dn)
+                layer.mlp.experts = base
+                saved_wrappers.append((layer.mlp, wrap, orig_gu, orig_dn))
+        model.save_pretrained(save_dir, safe_serialization=True)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(save_dir)
+    finally:
+        # Restore training wrappers + unmerged base weights seamlessly
+        for mlp, wrap, orig_gu, orig_dn in saved_wrappers:
+            wrap.base_experts.gate_up_proj.data.copy_(orig_gu)
+            wrap.base_experts.down_proj.data.copy_(orig_dn)
+            mlp.experts = wrap
 
 
 def load_cluster_maps(
@@ -254,6 +375,8 @@ def select_trainable_params(
     main_params: List[nn.Parameter] = []
 
     for name, p in model.named_parameters():
+        if ".base_experts." in name:
+            continue
         if cfg.trainable_scope == "moe":
             is_target = (
                 ".mlp.gate." in name

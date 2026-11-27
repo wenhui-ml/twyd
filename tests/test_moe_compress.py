@@ -316,3 +316,35 @@ def test_stage2_recovery_logit_kl_router_kl_and_cpu_offloaded_adamw(tmp_path):
 
     assert losses[-1] < losses[0], f"Expected recovery loss to decrease: {losses}"
 
+
+def test_moe_expert_lora_merge_parity(tmp_path):
+    """Verify MoeExpertLoRAWrapper Step-0 identity and exact merged native HF reload parity."""
+    from twyd.moe_compress.recover import inject_moe_expert_lora_, save_merged_native_moe
+
+    m = _tiny_olmoe(seed=13, num_experts=4, top_k=2, num_layers=2)
+    x = torch.randint(3, 128, (2, 16))
+    with torch.no_grad():
+        y_base = m(input_ids=x, use_cache=False).logits
+
+    n = inject_moe_expert_lora_(m, rank=8, alpha=16.0)
+    assert n == 2
+    with torch.no_grad():
+        y_step0 = m(input_ids=x, use_cache=False).logits
+    assert torch.allclose(y_base, y_step0, atol=1e-6, rtol=1e-6)
+
+    # Perturb B matrices to simulate training, then verify merged native reload matches wrapped forward
+    with torch.no_grad():
+        for layer in m.model.layers:
+            layer.mlp.experts.gu_B.normal_(0.0, 0.05)
+            layer.mlp.experts.dn_B.normal_(0.0, 0.05)
+        y_wrapped = m(input_ids=x, use_cache=False).logits
+
+    save_dir = str(tmp_path / "merged_native")
+    save_merged_native_moe(m, save_dir)
+    reloaded = AutoModelForCausalLM.from_pretrained(save_dir, trust_remote_code=False).eval()
+    assert isinstance(reloaded, OlmoeForCausalLM)
+    with torch.no_grad():
+        y_disk = reloaded(input_ids=x, use_cache=False).logits
+    assert torch.allclose(y_wrapped, y_disk, atol=1e-4, rtol=1e-4)
+
+
