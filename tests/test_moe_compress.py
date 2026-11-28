@@ -388,4 +388,40 @@ def test_hidden_cosine_alignment_jsd_and_all_no_embed_scope():
     assert student.model.layers[0].self_attn.q_proj.weight.grad is not None
 
 
+def test_fast_block_dispatch_parity_and_fullrank_nonlinear_distill():
+    """Verify single-argsort dispatch matches native OlmoeSparseMoeBlock and cuts valMSE sharply."""
+    from twyd.moe_compress.block_distill import (
+        BlockDistillConfig,
+        distill_moe_layer_fullrank,
+        fast_olmoe_block_forward,
+    )
+
+    teacher = _tiny_olmoe(seed=71, num_experts=8, top_k=2, norm_topk_prob=False, num_layers=1)
+    student = _tiny_olmoe(seed=72, num_experts=4, top_k=2, norm_topk_prob=False, num_layers=1)
+    s_mlp = student.model.layers[0].mlp
+
+    torch.manual_seed(73)
+    x = torch.randn(64, 64)
+    # 1. Exact forward parity vs native OlmoeSparseMoeBlock
+    with torch.no_grad():
+        ref_y = s_mlp(x.unsqueeze(0)).squeeze(0)
+        fast_y, _, aux = fast_olmoe_block_forward(
+            x, s_mlp.gate.weight, s_mlp.experts.gate_up_proj, s_mlp.experts.down_proj, s_mlp.experts.act_fn, 2, False
+        )
+    assert torch.allclose(ref_y, fast_y, atol=1e-5, rtol=1e-4)
+    assert float(aux.item()) > 0.0
+
+    # 2. Full-rank nonlinear distillation strictly reduces valMSE against 8-expert teacher
+    x_big = torch.randn(512, 64)
+    with torch.no_grad():
+        y_teacher = teacher.model.layers[0].mlp(x_big.unsqueeze(0)).squeeze(0)
+
+    cfg = BlockDistillConfig(steps_per_layer=80, batch_tokens=128, lr=5e-3, eval_every=40, warmup_steps=5)
+    st = distill_moe_layer_fullrank(s_mlp, x_big, y_teacher, cfg, layer_idx=0, device="cpu", verbose=False)
+    assert st.best_val_rel_mse < st.init_val_rel_mse * 0.75, (
+        f"Expected sharp valMSE reduction: {st.init_val_rel_mse:.4f} -> {st.best_val_rel_mse:.4f}"
+    )
+
+
+
 
