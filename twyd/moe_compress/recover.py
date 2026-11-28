@@ -31,17 +31,21 @@ class RecoveryConfig:
     kl_topk: int = 256
     kl_weight: float = 2.0
     ce_weight: float = 1.0
+    jsd_beta: float = 0.0                  # 0.0 = exact Forward KL; (0,1) = Generalized JSD
     router_kl_weight: float = 0.2
-    router_target_mode: str = "survivor"  # "survivor" (conditional over kept experts) | "cluster"
+    router_target_mode: str = "survivor"   # "survivor" | "cluster"
+    hidden_align_weight: float = 0.5       # same-width hidden cosine alignment weight
+    hidden_align_layers: Tuple[int, ...] = (3, 7, 11, 15)
     aux_loss_weight: float = 0.01
     chunk_size: int = 512
     lr: float = 2e-4
     router_lr_scale: float = 0.5
+    attn_lr_scale: float = 0.3
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
-    lora_rank: int = 64            # >0 = mergeable per-expert LoRA (0 = full-rank)
+    lora_rank: int = 64                    # >0 = mergeable per-expert LoRA (0 = full-rank)
     lora_alpha: float = 64.0
-    trainable_scope: str = "moe"   # "moe" (experts+routers+norms) | "all"
+    trainable_scope: str = "moe"           # "moe" | "all_no_embed" | "all"
     cpu_offload_optimizer: bool = False
 
 
@@ -146,8 +150,8 @@ def save_merged_native_moe(model: nn.Module, save_dir: str, tokenizer=None) -> N
             if hasattr(layer, "mlp") and isinstance(layer.mlp.experts, MoeExpertLoRAWrapper):
                 wrap = layer.mlp.experts
                 base = wrap.base_experts
-                orig_gu = base.gate_up_proj.data.clone()
-                orig_dn = base.down_proj.data.clone()
+                orig_gu = base.gate_up_proj.data.detach().cpu().clone()
+                orig_dn = base.down_proj.data.detach().cpu().clone()
                 merged_gu, merged_dn = wrap.merged_weights()
                 base.gate_up_proj.data.copy_(merged_gu)
                 base.down_proj.data.copy_(merged_dn)
@@ -159,8 +163,8 @@ def save_merged_native_moe(model: nn.Module, save_dir: str, tokenizer=None) -> N
     finally:
         # Restore training wrappers + unmerged base weights seamlessly
         for mlp, wrap, orig_gu, orig_dn in saved_wrappers:
-            wrap.base_experts.gate_up_proj.data.copy_(orig_gu)
-            wrap.base_experts.down_proj.data.copy_(orig_dn)
+            wrap.base_experts.gate_up_proj.data.copy_(orig_gu.to(wrap.base_experts.gate_up_proj.device))
+            wrap.base_experts.down_proj.data.copy_(orig_dn.to(wrap.base_experts.down_proj.device))
             mlp.experts = wrap
 
 
@@ -261,9 +265,9 @@ def _chunk_topk_kl_ce(
     p_t_tail_c: torch.Tensor,
     y_c: torch.Tensor,
     T: float,
+    jsd_beta: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Checkpointed per-chunk Top-K + Tail-Bucket KL and CE (fp32 numerics)."""
-    V = int(s_c.size(-1))
+    """Checkpointed per-chunk Top-K + Tail-Bucket Forward-KL or Generalized JSD + CE (fp32)."""
     s_f = s_c.float()
     logp_s_T = F.log_softmax(s_f / T, dim=-1)
     idx64 = top_idx_c.long()
@@ -273,10 +277,24 @@ def _chunk_topk_kl_ce(
     logp_t_top = logp_t_top_c.float()
     p_t_tail = p_t_tail_c.float()
 
-    p_s_tail = (1.0 - logp_s_top.exp().sum(dim=-1)).clamp_min(1e-9)
-    kl_top = (p_t_top * (logp_t_top - logp_s_top)).sum(dim=-1)
-    kl_tail = p_t_tail * (p_t_tail.log() - p_s_tail.log())
-    kl_tok = (kl_top + kl_tail) * (T * T)
+    p_s_top = logp_s_top.exp()
+    p_s_tail = (1.0 - p_s_top.sum(dim=-1)).clamp_min(1e-9)
+
+    if jsd_beta <= 0.0:
+        kl_top = (p_t_top * (logp_t_top - logp_s_top)).sum(dim=-1)
+        kl_tail = p_t_tail * (p_t_tail.log() - p_s_tail.log())
+        kl_tok = (kl_top + kl_tail) * (T * T)
+    else:
+        # Exact Generalized JSD_beta(P_T || P_S) over Top-K + Tail bucket
+        b = float(jsd_beta)
+        m_top = ((1.0 - b) * p_t_top + b * p_s_top).clamp_min(1e-12)
+        m_tail = ((1.0 - b) * p_t_tail + b * p_s_tail).clamp_min(1e-12)
+        log_m_top = m_top.log()
+        log_m_tail = m_tail.log()
+        kl_tm = (p_t_top * (logp_t_top - log_m_top)).sum(dim=-1) + p_t_tail * (p_t_tail.log() - log_m_tail)
+        kl_sm = (p_s_top * (logp_s_top - log_m_top)).sum(dim=-1) + p_s_tail * (p_s_tail.log() - log_m_tail)
+        # Scale by 1 / (b * (1 - b))? Keep canonical 2x JSD scale so magnitude matches KL.
+        kl_tok = ((1.0 - b) * kl_tm + b * kl_sm) * (T * T) / max(b * (1.0 - b) * 4.0, 1e-6)
 
     if T == 1.0:
         ce_tok = F.nll_loss(logp_s_T, y_c.long(), ignore_index=-100, reduction="none")
@@ -295,6 +313,7 @@ def compute_fused_logit_kl_ce(
     T: float = 1.0,
     chunk_size: int = 512,
     use_checkpoint: bool = True,
+    jsd_beta: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute masked mean (kl_loss, ce_loss) over all valid next-token positions (`labels != -100`)."""
     shift_s = s_logits[:, :-1, :].contiguous()
@@ -321,11 +340,11 @@ def compute_fused_logit_kl_ce(
         if use_checkpoint and sc.requires_grad:
             kl_c, ce_c = _ckpt(
                 _chunk_topk_kl_ce,
-                sc, ic, ltc, ptc, ptail, yc, T,
+                sc, ic, ltc, ptc, ptail, yc, T, jsd_beta,
                 use_reentrant=False,
             )
         else:
-            kl_c, ce_c = _chunk_topk_kl_ce(sc, ic, ltc, ptc, ptail, yc, T)
+            kl_c, ce_c = _chunk_topk_kl_ce(sc, ic, ltc, ptc, ptail, yc, T, jsd_beta)
 
         vf = vc.float()
         kl_sum = kl_sum + (kl_c * vf).sum()
@@ -333,6 +352,62 @@ def compute_fused_logit_kl_ce(
 
     denom = valid.float().sum().clamp_min(1.0)
     return kl_sum / denom, ce_sum / denom
+
+
+@torch.no_grad()
+def extract_teacher_hidden_targets(
+    teacher_hidden_states: Sequence[torch.Tensor],
+    layer_indices: Sequence[int],
+) -> List[torch.Tensor]:
+    """Extract bf16 teacher hidden states after transformer blocks `layer_indices`.
+
+    `teacher_hidden_states` has length `L + 1` (index 0 = embeddings, index `l + 1` = output of block `l`).
+    """
+    n_states = len(teacher_hidden_states)
+    out: List[torch.Tensor] = []
+    for l_idx in layer_indices:
+        pos = int(l_idx) + 1
+        if 0 <= pos < n_states:
+            out.append(teacher_hidden_states[pos].detach().to(torch.bfloat16))
+    return out
+
+
+def compute_hidden_cosine_loss(
+    student_hidden_states: Sequence[torch.Tensor],
+    teacher_hidden_targets: Sequence[torch.Tensor],
+    layer_indices: Sequence[int],
+    token_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Mean `1 - cos(h_S, h_T)` across tapped layers (exact same-width alignment, zero extra params)."""
+    if not student_hidden_states or not teacher_hidden_targets:
+        dev = student_hidden_states[0].device if student_hidden_states else torch.device("cpu")
+        return torch.zeros((), dtype=torch.float32, device=dev)
+
+    dev = student_hidden_states[0].device
+    mask_f = token_mask.reshape(-1).float().to(dev) if token_mask is not None else None
+    denom = mask_f.sum().clamp_min(1.0) if mask_f is not None else None
+
+    total = torch.zeros((), dtype=torch.float32, device=dev)
+    count = 0
+    n_states = len(student_hidden_states)
+    t_iter = iter(teacher_hidden_targets)
+    for l_idx in layer_indices:
+        pos = int(l_idx) + 1
+        if not (0 <= pos < n_states):
+            continue
+        ht = next(t_iter, None)
+        if ht is None:
+            break
+        hs = student_hidden_states[pos].float().reshape(-1, student_hidden_states[pos].shape[-1])
+        ht_d = ht.to(device=dev, dtype=torch.float32).reshape(-1, ht.shape[-1])
+        cos = F.cosine_similarity(hs, ht_d, dim=-1)
+        dist = 1.0 - cos
+        if mask_f is not None:
+            total = total + (dist * mask_f).sum() / denom
+        else:
+            total = total + dist.mean()
+        count += 1
+    return total / max(count, 1)
 
 
 def compute_router_kl_loss(
@@ -372,6 +447,7 @@ def select_trainable_params(
         p.requires_grad = False
 
     router_params: List[nn.Parameter] = []
+    attn_params: List[nn.Parameter] = []
     main_params: List[nn.Parameter] = []
 
     for name, p in model.named_parameters():
@@ -385,18 +461,25 @@ def select_trainable_params(
             )
             if not is_target:
                 continue
+        elif cfg.trainable_scope == "all_no_embed":
+            if "embed_tokens" in name or "lm_head" in name:
+                continue
         elif cfg.trainable_scope != "all":
             raise ValueError(f"Unknown trainable_scope={cfg.trainable_scope!r}")
 
         p.requires_grad = True
         if ".mlp.gate." in name:
             router_params.append(p)
+        elif ".self_attn." in name or ".input_layernorm." in name or "embed_tokens" in name or "lm_head" in name:
+            attn_params.append(p)
         else:
             main_params.append(p)
 
     groups: List[Dict] = []
     if main_params:
         groups.append({"params": main_params, "lr": cfg.lr, "weight_decay": cfg.weight_decay})
+    if attn_params:
+        groups.append({"params": attn_params, "lr": cfg.lr * cfg.attn_lr_scale, "weight_decay": cfg.weight_decay})
     if router_params:
         groups.append({
             "params": router_params,

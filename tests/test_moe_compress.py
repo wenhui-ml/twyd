@@ -348,3 +348,44 @@ def test_moe_expert_lora_merge_parity(tmp_path):
     assert torch.allclose(y_wrapped, y_disk, atol=1e-4, rtol=1e-4)
 
 
+def test_hidden_cosine_alignment_jsd_and_all_no_embed_scope():
+    """Verify same-width hidden cosine alignment, Generalized JSD, and all_no_embed scope."""
+    from twyd.moe_compress.recover import (
+        RecoveryConfig,
+        compute_fused_logit_kl_ce,
+        compute_hidden_cosine_loss,
+        extract_teacher_hidden_targets,
+        extract_teacher_topk_targets,
+        select_trainable_params,
+    )
+
+    teacher = _tiny_olmoe(seed=31, num_experts=8, top_k=2, num_layers=2)
+    student = _tiny_olmoe(seed=32, num_experts=4, top_k=2, num_layers=2)
+    x = torch.randint(3, 128, (2, 16))
+    labels = x.clone()
+    labels[:, :6] = -100  # prompt mask
+
+    with torch.no_grad():
+        t_out = teacher(input_ids=x, use_cache=False, output_hidden_states=True)
+        top_idx, logp_t, p_t, p_tail = extract_teacher_topk_targets(t_out.logits, 32, 1.0, 16)
+        h_targets = extract_teacher_hidden_targets(t_out.hidden_states, (0, 1))
+    assert len(h_targets) == 2
+
+    cfg = RecoveryConfig(trainable_scope="all_no_embed", attn_lr_scale=0.3, router_lr_scale=0.5)
+    groups = select_trainable_params(student, cfg)
+    assert len(groups) == 3  # main (MoE), attn, router
+    assert not student.model.embed_tokens.weight.requires_grad
+    assert not student.lm_head.weight.requires_grad
+    assert student.model.layers[0].self_attn.q_proj.weight.requires_grad
+
+    s_out = student(input_ids=x, use_cache=False, output_hidden_states=True)
+    jsd_l, ce_l = compute_fused_logit_kl_ce(
+        s_out.logits, labels, top_idx, logp_t, p_t, p_tail, T=1.0, chunk_size=16, use_checkpoint=False, jsd_beta=0.3
+    )
+    hid_l = compute_hidden_cosine_loss(s_out.hidden_states, h_targets, (0, 1), token_mask=(labels != -100))
+    assert float(jsd_l.item()) > 0.0 and float(ce_l.item()) > 0.0 and float(hid_l.item()) > 0.0
+    (jsd_l + ce_l + 0.5 * hid_l).backward()
+    assert student.model.layers[0].self_attn.q_proj.weight.grad is not None
+
+
+
