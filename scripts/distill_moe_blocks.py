@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher", default=os.path.expanduser("~/models/OLMoE-1B-7B-0125-Instruct"))
     p.add_argument("--student", default=os.path.join(ROOT, "output/moe_lrc/olmoe-prog-bal-e16-k8"))
     p.add_argument("--out", default=os.path.join(ROOT, "output/moe_lrc/olmoe-blockdistill-e16-k8"))
-    p.add_argument("--num-seqs", type=int, default=1024, help="Total sequences (50% prose + 50% open SFT/QA)")
+    p.add_argument("--num-seqs", type=int, default=1024, help="Total sequences (half prose + half open SFT/QA)")
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--steps-per-layer", type=int, default=1200)
     p.add_argument("--batch-tokens", type=int, default=4096)
@@ -144,29 +144,45 @@ def main() -> None:
 
     layer_stats = []
     n_layers = len(student.model.layers)
+    cache_dir = os.path.join(args.out, "_layer_cache")
+    os.makedirs(cache_dir, exist_ok=True)
     for l_idx in range(n_layers):
-        s_layer = student.model.layers[l_idx].to(dev).eval()
-        # 1. Capture exact pre-MLP inputs entering layer l from previous distilled layers
-        x_flat = _layer_pre_mlp_inputs(s_layer, h_stu, pe_list, pid_list, dev)
-        s_layer.to("cpu")
-        torch.cuda.empty_cache()
+        l_ckpt = os.path.join(cache_dir, f"layer_{l_idx:02d}.pt")
+        l_meta = os.path.join(cache_dir, f"layer_{l_idx:02d}.json")
+        if os.path.isfile(l_ckpt) and os.path.isfile(l_meta):
+            student.model.layers[l_idx].mlp.load_state_dict(torch.load(l_ckpt, map_location="cpu", weights_only=True))
+            st_dict = json.load(open(l_meta))
+            layer_stats.append(st_dict)
+            print(f"[block-distill] L{l_idx:02d} RESUMED from cache (valMSE {st_dict['init_val_rel_mse']:.4f} -> {st_dict['best_val_rel_mse']:.4f})", flush=True)
+        else:
+            s_layer = student.model.layers[l_idx].to(dev).eval()
+            # 1. Capture exact pre-MLP inputs entering layer l from previous distilled layers
+            x_flat = _layer_pre_mlp_inputs(s_layer, h_stu, pe_list, pid_list, dev)
+            s_layer.to("cpu")
+            torch.cuda.empty_cache()
 
-        # 2. Compute exact 64-expert Teacher MoE output vector Y_l^(T)(x_flat)
-        y_teacher = compute_teacher_mlp_outputs(teacher.model.layers[l_idx].mlp, x_flat, dev)
+            # 2. Compute exact 64-expert Teacher MoE output vector Y_l^(T)(x_flat)
+            y_teacher = compute_teacher_mlp_outputs(teacher.model.layers[l_idx].mlp, x_flat, dev)
 
-        # 3. Full-rank nonlinear MoE-to-MoE distillation on layer l's student MLP
-        s_mlp = student.model.layers[l_idx].mlp.to(dev)
-        st = distill_moe_layer_fullrank(s_mlp, x_flat, y_teacher, cfg, layer_idx=l_idx, device=dev, verbose=True)
-        layer_stats.append(asdict(st))
-        s_mlp.to("cpu")
-        del x_flat, y_teacher
-        torch.cuda.empty_cache()
+            # 3. Full-rank nonlinear MoE-to-MoE distillation on layer l's student MLP
+            s_mlp = student.model.layers[l_idx].mlp.to(dev)
+            st = distill_moe_layer_fullrank(s_mlp, x_flat, y_teacher, cfg, layer_idx=l_idx, device=dev, verbose=True)
+            st_dict = asdict(st)
+            layer_stats.append(st_dict)
+            s_mlp.to("cpu")
+            torch.save(s_mlp.state_dict(), l_ckpt)
+            json.dump(st_dict, open(l_meta, "w"), indent=2)
+            del x_flat, y_teacher
+            torch.cuda.empty_cache()
 
         # 4. Advance student hidden states through the newly distilled layer l
         s_layer = student.model.layers[l_idx].to(dev).eval()
         h_stu = _advance_hidden_states(s_layer, h_stu, pe_list, pid_list, dev)
         s_layer.to("cpu")
         torch.cuda.empty_cache()
+
+    import shutil
+    shutil.rmtree(cache_dir, ignore_errors=True)
 
     del h_stu, pe_list, pid_list, teacher
     torch.cuda.empty_cache()
